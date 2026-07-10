@@ -1,0 +1,606 @@
+#!/usr/bin/env bash
+#
+# xraycli — user-scope control script for an Xray-core proxy.
+#
+# Everything it manages lives under $HOME (XDG dirs) and a *user* systemd unit.
+# It never uses sudo and never writes outside the invoking user's scope.
+#
+#   Layout
+#     ~/.local/bin/xraycli                    this script
+#     ~/.local/share/xraycli/core/xray        the Xray-core binary + geodata
+#     ~/.config/xraycli/config.json           generated Xray config
+#     ~/.config/xraycli/xraycli.env           ports / listen / version
+#     ~/.config/xraycli/nodes.json            saved server nodes
+#     ~/.config/xraycli/active_outbound.json  outbound used by the active node
+#     ~/.local/state/xraycli/{access,error}.log
+#     ~/.config/systemd/user/xraycli.service  user systemd unit
+#
+# Run `xraycli help` for the command list.
+#
+set -uo pipefail
+
+readonly XRAYCLI_VERSION_SELF="0.1.0"
+readonly APP="xraycli"
+
+# --------------------------------------------------------------------------- #
+#  Paths (XDG, all under $HOME)                                               #
+# --------------------------------------------------------------------------- #
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+: "${XDG_STATE_HOME:=$HOME/.local/state}"
+
+readonly BIN_SELF="$HOME/.local/bin/xraycli"
+readonly DATA_DIR="$XDG_DATA_HOME/$APP"
+readonly CORE_DIR="$DATA_DIR/core"
+readonly CORE_BIN="$CORE_DIR/xray"
+readonly CONFIG_DIR="$XDG_CONFIG_HOME/$APP"
+readonly STATE_DIR="$XDG_STATE_HOME/$APP"
+readonly SYSTEMD_DIR="$XDG_CONFIG_HOME/systemd/user"
+readonly SERVICE_NAME="$APP.service"
+readonly SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
+
+readonly ENV_FILE="$CONFIG_DIR/xraycli.env"
+readonly CONFIG_FILE="$CONFIG_DIR/config.json"
+readonly NODES_FILE="$CONFIG_DIR/nodes.json"
+readonly ACTIVE_OUTBOUND="$CONFIG_DIR/active_outbound.json"
+readonly ACTIVE_NAME_FILE="$CONFIG_DIR/active_name"
+readonly SUB_FILE="$CONFIG_DIR/subscription"
+readonly PID_FILE="$STATE_DIR/xray.pid"
+readonly BASHRC="$HOME/.bashrc"
+
+# --------------------------------------------------------------------------- #
+#  Output helpers                                                             #
+# --------------------------------------------------------------------------- #
+if [ -t 1 ]; then
+  c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+  c_blu=$'\033[34m'; c_dim=$'\033[2m'; c_bld=$'\033[1m'; c_rst=$'\033[0m'
+else
+  c_red=; c_grn=; c_ylw=; c_blu=; c_dim=; c_bld=; c_rst=
+fi
+info() { printf '%s==>%s %s\n' "$c_blu" "$c_rst" "$*"; }
+ok()   { printf '%s ✓ %s %s\n' "$c_grn" "$c_rst" "$*"; }
+warn() { printf '%s ! %s %s\n' "$c_ylw" "$c_rst" "$*" >&2; }
+die()  { printf '%s ✗ %s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+need_jq() { have jq || die "jq is required for node management — install it (e.g. apt install jq)"; }
+
+# --------------------------------------------------------------------------- #
+#  Environment                                                                #
+# --------------------------------------------------------------------------- #
+load_env() {
+  LISTEN="127.0.0.1"; SOCKS_PORT="10808"; HTTP_PORT="10809"; XRAYCLI_VERSION="unknown"
+  # shellcheck disable=SC1090
+  [ -f "$ENV_FILE" ] && . "$ENV_FILE"
+  LISTEN="${XRAYCLI_LISTEN:-$LISTEN}"
+  SOCKS_PORT="${XRAYCLI_SOCKS_PORT:-$SOCKS_PORT}"
+  HTTP_PORT="${XRAYCLI_HTTP_PORT:-$HTTP_PORT}"
+  XRAYCLI_VERSION="${XRAYCLI_VERSION:-unknown}"
+}
+
+ensure_installed() {
+  [ -x "$CORE_BIN" ] || die "Xray core not found at $CORE_BIN — run install.sh first"
+}
+
+core_version() {
+  [ -x "$CORE_BIN" ] || { echo "n/a"; return; }
+  XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" version 2>/dev/null | head -1 | awk '{print $2}'
+}
+
+# --------------------------------------------------------------------------- #
+#  systemd / process helpers                                                  #
+# --------------------------------------------------------------------------- #
+have_systemd_user() { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }
+service_installed() { [ -f "$SERVICE_FILE" ]; }
+use_systemd() { service_installed && have_systemd_user; }
+
+is_running() {
+  if use_systemd; then
+    systemctl --user is-active --quiet "$SERVICE_NAME"
+  else
+    [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+  fi
+}
+
+write_service_unit() {
+  mkdir -p "$SYSTEMD_DIR"
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Xray proxy (managed by xraycli)
+Documentation=https://github.com/XTLS/Xray-core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=XRAY_LOCATION_ASSET=%h/.local/share/$APP/core
+ExecStart=%h/.local/share/$APP/core/xray run -config %h/.config/$APP/config.json
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
+EOF
+  have_systemd_user && systemctl --user daemon-reload 2>/dev/null || true
+}
+
+manual_start() {
+  is_running && { warn "already running (pid $(cat "$PID_FILE"))"; return 0; }
+  mkdir -p "$STATE_DIR"
+  XRAY_LOCATION_ASSET="$CORE_DIR" nohup "$CORE_BIN" run -config "$CONFIG_FILE" \
+    >>"$STATE_DIR/error.log" 2>&1 &
+  echo $! > "$PID_FILE"
+  sleep 1
+  if is_running; then ok "started (pid $(cat "$PID_FILE"), no systemd)"
+  else die "failed to start — check $STATE_DIR/error.log"; fi
+}
+
+manual_stop() {
+  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null && ok "stopped"
+  else
+    warn "not running"
+  fi
+  rm -f "$PID_FILE"
+}
+
+restart_if_running() { if is_running; then cmd_restart; fi; }
+
+# --------------------------------------------------------------------------- #
+#  Config generation (single source of truth, used by install.sh too)        #
+# --------------------------------------------------------------------------- #
+cmd_regen() {
+  load_env
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+  local proxy_ob
+  if [ -f "$ACTIVE_OUTBOUND" ]; then
+    proxy_ob="$(cat "$ACTIVE_OUTBOUND")"
+  else
+    proxy_ob='{ "tag": "proxy", "protocol": "freedom", "settings": {} }'
+  fi
+  cat > "$CONFIG_FILE" <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "$STATE_DIR/access.log",
+    "error": "$STATE_DIR/error.log"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "$LISTEN",
+      "port": $SOCKS_PORT,
+      "protocol": "socks",
+      "settings": { "udp": true, "auth": "noauth" },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    },
+    {
+      "tag": "http-in",
+      "listen": "$LISTEN",
+      "port": $HTTP_PORT,
+      "protocol": "http",
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    }
+  ],
+  "outbounds": [
+    $proxy_ob,
+    { "tag": "direct", "protocol": "freedom", "settings": {} },
+    { "tag": "block", "protocol": "blackhole", "settings": {} }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" }
+    ]
+  }
+}
+EOF
+  if [ -x "$CORE_BIN" ]; then
+    XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1 \
+      || warn "generated config did not pass 'xray -test' (active node may be malformed)"
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+#  Node selection helpers                                                     #
+# --------------------------------------------------------------------------- #
+ensure_nodes() { [ -f "$NODES_FILE" ] || echo '[]' > "$NODES_FILE"; }
+
+current_name() { [ -f "$ACTIVE_NAME_FILE" ] && cat "$ACTIVE_NAME_FILE" || echo ""; }
+
+select_node() {  # echoes the JSON node for <index|name>, or fails
+  local sel="$1"
+  if [[ "$sel" =~ ^[0-9]+$ ]]; then
+    jq -e ".[$sel]" "$NODES_FILE" 2>/dev/null
+  else
+    jq -e --arg n "$sel" 'map(select(.name==$n)) | .[0] // empty' "$NODES_FILE" 2>/dev/null
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+#  Commands: lifecycle                                                        #
+# --------------------------------------------------------------------------- #
+cmd_start() {
+  ensure_installed
+  [ -f "$CONFIG_FILE" ] || cmd_regen
+  if use_systemd; then
+    systemctl --user start "$SERVICE_NAME" && ok "started (systemd user service)"
+  else
+    manual_start
+  fi
+}
+
+cmd_stop() {
+  if use_systemd; then
+    systemctl --user stop "$SERVICE_NAME" && ok "stopped"
+  else
+    manual_stop
+  fi
+}
+
+cmd_restart() {
+  ensure_installed
+  if use_systemd; then
+    systemctl --user restart "$SERVICE_NAME" && ok "restarted"
+  else
+    manual_stop; manual_start
+  fi
+}
+
+cmd_enable() {
+  ensure_installed
+  service_installed || write_service_unit
+  have_systemd_user || die "no user systemd session — cannot enable a service (use 'xraycli start')"
+  # Make the service survive logout.
+  if have loginctl; then
+    loginctl enable-linger "$(id -un)" 2>/dev/null \
+      && ok "enabled linger (service runs even when logged out)" \
+      || warn "could not enable linger (service may stop on logout)"
+  fi
+  systemctl --user enable --now "$SERVICE_NAME" && ok "enabled + started on login"
+}
+
+cmd_disable() {
+  if use_systemd; then
+    systemctl --user disable --now "$SERVICE_NAME" 2>/dev/null && ok "disabled + stopped"
+  else
+    manual_stop
+  fi
+  warn "note: user 'linger' is left enabled (it is user-global). Disable with: loginctl disable-linger $(id -un)"
+}
+
+cmd_status() {
+  load_env
+  local running node
+  node="$(current_name)"; [ -n "$node" ] || node="(direct — no proxy node)"
+  is_running && running="${c_grn}running${c_rst}" || running="${c_red}stopped${c_rst}"
+  printf '%s%s%s\n' "$c_bld" "$APP status" "$c_rst"
+  printf '  version : xraycli %s  /  xray %s\n' "$XRAYCLI_VERSION_SELF" "$(core_version)"
+  printf '  listen  : %s   socks %s   http %s\n' "$LISTEN" "$SOCKS_PORT" "$HTTP_PORT"
+  printf '  node    : %s\n' "$node"
+  printf '  running : %b\n' "$running"
+  printf '  mode    : %s\n' "$(use_systemd && echo 'systemd user service' || echo 'manual process')"
+  echo
+  if use_systemd; then
+    systemctl --user status "$SERVICE_NAME" --no-pager -l 2>/dev/null | sed 's/^/  /' || true
+  elif [ -f "$PID_FILE" ]; then
+    printf '  pid     : %s\n' "$(cat "$PID_FILE")"
+  fi
+}
+
+cmd_log() {
+  local what="${1:-service}"
+  case "$what" in
+    error)  tail -n 200 -f "$STATE_DIR/error.log" ;;
+    access) tail -n 200 -f "$STATE_DIR/access.log" ;;
+    service)
+      if use_systemd; then journalctl --user -u "$SERVICE_NAME" -e -f
+      else tail -n 200 -f "$STATE_DIR/error.log"; fi ;;
+    *) die "usage: xraycli log [service|error|access]" ;;
+  esac
+}
+
+cmd_test() {
+  ensure_installed
+  load_env
+  is_running || { warn "service is not running — start it first (xraycli start)"; return 1; }
+  have curl || die "curl is required for 'test'"
+  info "probing egress IP through http://$LISTEN:$HTTP_PORT ..."
+  local ip
+  ip="$(curl -fsS --max-time 15 -x "http://$LISTEN:$HTTP_PORT" https://api.ip.sb/ip 2>/dev/null \
+        || curl -fsS --max-time 15 -x "http://$LISTEN:$HTTP_PORT" https://ipinfo.io/ip 2>/dev/null)"
+  if [ -n "${ip:-}" ]; then ok "proxy works — egress IP: $ip"
+  else die "could not reach the internet through the proxy (check the active node)"; fi
+}
+
+# --------------------------------------------------------------------------- #
+#  Commands: config / ports                                                   #
+# --------------------------------------------------------------------------- #
+cmd_port() {
+  load_env
+  printf 'socks  %s:%s\n' "$LISTEN" "$SOCKS_PORT"
+  printf 'http   %s:%s\n' "$LISTEN" "$HTTP_PORT"
+}
+
+cmd_config() {
+  case "${1:-show}" in
+    show|"") ensure_installed; [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE" || die "no config yet" ;;
+    path)    printf '%s\n' "$CONFIG_FILE" ;;
+    edit)    "${EDITOR:-vi}" "$CONFIG_FILE"; cmd_regen; restart_if_running ;;
+    regen)   cmd_regen; ok "regenerated $CONFIG_FILE" ;;
+    *) die "usage: xraycli config [show|path|edit|regen]" ;;
+  esac
+}
+
+# --------------------------------------------------------------------------- #
+#  Commands: nodes / subscription                                             #
+# --------------------------------------------------------------------------- #
+cmd_list() {
+  need_jq; ensure_nodes
+  local n; n="$(jq 'length' "$NODES_FILE")"
+  if [ "$n" -eq 0 ]; then
+    echo "no nodes yet."
+    echo "  add one   : xraycli add '<share-link>'"
+    echo "  or import : xraycli sub set '<url>' && xraycli update"
+    return 0
+  fi
+  local cur; cur="$(current_name)"
+  jq -r --arg cur "$cur" '
+    to_entries[] |
+    "  [\(.key)] \(if .value.name==$cur then "* " else "  " end)\(.value.name)  (\(.value.outbound.protocol // "?"))"
+  ' "$NODES_FILE"
+  echo
+  echo "  * = active   |   switch with: xraycli use <index|name>"
+}
+
+cmd_current() {
+  local cur; cur="$(current_name)"
+  [ -n "$cur" ] && echo "$cur" || echo "(direct — no proxy node)"
+}
+
+cmd_use() {
+  need_jq; ensure_nodes
+  local sel="${1:?usage: xraycli use <index|name>}" node name ob
+  node="$(select_node "$sel")" || die "no such node: $sel  (see: xraycli list)"
+  [ -n "$node" ] && [ "$node" != "null" ] || die "no such node: $sel"
+  name="$(jq -r '.name' <<<"$node")"
+  ob="$(jq '.outbound | .tag = "proxy"' <<<"$node")"
+  printf '%s\n' "$ob" > "$ACTIVE_OUTBOUND"
+  printf '%s\n' "$name" > "$ACTIVE_NAME_FILE"
+  cmd_regen
+  restart_if_running
+  ok "active node: $name"
+}
+
+cmd_remove() {
+  need_jq; ensure_nodes
+  local sel="${1:?usage: xraycli remove <index|name>}" node name
+  node="$(select_node "$sel")" || die "no such node: $sel"
+  name="$(jq -r '.name' <<<"$node")"
+  jq --arg n "$name" 'map(select(.name != $n))' "$NODES_FILE" > "$NODES_FILE.tmp" && mv "$NODES_FILE.tmp" "$NODES_FILE"
+  if [ "$(current_name)" = "$name" ]; then cmd_direct >/dev/null; fi
+  ok "removed node: $name"
+}
+
+cmd_direct() {
+  rm -f "$ACTIVE_OUTBOUND" "$ACTIVE_NAME_FILE"
+  cmd_regen
+  restart_if_running
+  ok "switched to direct (traffic bypasses any proxy node)"
+}
+
+# ---- subscription / share-link import ----------------------------------- #
+#
+# NOTE: the actual parsing is intentionally left as a stub. Once the target
+# subscription format and node types are known, implement the two functions
+# below; every other command (list/use/remove/current/direct) already works
+# against nodes.json, so importers only need to produce entries of the shape:
+#
+#     { "name": "<label>", "outbound": { <a valid Xray outbound object> } }
+#
+# and append/replace them in nodes.json.
+#
+parse_share_link() {  # parse_share_link <uri>  ->  TODO: echo a node JSON object
+  return 3  # not implemented yet
+}
+parse_subscription() {  # parse_subscription <url> -> TODO: echo a JSON array of nodes
+  return 3  # not implemented yet
+}
+
+cmd_add() {
+  local link="${1:-}"
+  [ -n "$link" ] || die "usage: xraycli add '<share-link>'   (e.g. vmess://…, vless://…, trojan://…, ss://…)"
+  local scheme="${link%%://*}"
+  warn "share-link import is not wired up yet."
+  cat >&2 <<EOF
+      detected scheme : ${scheme}
+      planned support : vmess://  vless://  trojan://  ss://  (+ others on request)
+      to finish this  : implement parse_share_link() in $BIN_SELF
+                        (it should print a node object and be appended to nodes.json)
+EOF
+  return 2
+}
+
+cmd_sub() {
+  case "${1:-show}" in
+    set)   printf '%s\n' "${2:?usage: xraycli sub set <url>}" > "$SUB_FILE"; ok "subscription URL saved" ;;
+    show)  [ -f "$SUB_FILE" ] && cat "$SUB_FILE" || echo "(no subscription set)" ;;
+    clear) rm -f "$SUB_FILE"; ok "subscription cleared" ;;
+    update) cmd_update ;;
+    *) die "usage: xraycli sub {set <url>|show|clear|update}" ;;
+  esac
+}
+
+cmd_update() {
+  [ -f "$SUB_FILE" ] || die "no subscription set — run: xraycli sub set '<url>'"
+  local url; url="$(cat "$SUB_FILE")"
+  warn "subscription fetch/parse is not wired up yet."
+  cat >&2 <<EOF
+      subscription URL : $url
+      to finish this   : implement parse_subscription() in $BIN_SELF
+                         (fetch the URL, decode/parse nodes, write nodes.json,
+                          then: xraycli use <n> && xraycli restart)
+      tell me the subscription type (base64 link-list / Clash YAML / SIP008 / …)
+      and node protocols you use, and this will be implemented.
+EOF
+  return 2
+}
+
+# --------------------------------------------------------------------------- #
+#  Commands: version / uninstall / help                                       #
+# --------------------------------------------------------------------------- #
+cmd_version() {
+  load_env
+  printf 'xraycli %s\n' "$XRAYCLI_VERSION_SELF"
+  printf 'xray    %s\n' "$(core_version)"
+}
+
+remove_bashrc_block() {
+  local begin="# >>> xraycli >>>" end="# <<< xraycli <<<"
+  [ -f "$BASHRC" ] || return 0
+  grep -qF "$begin" "$BASHRC" || return 0
+  awk -v b="$begin" -v e="$end" '
+    $0==b {skip=1} !skip {print} $0==e {skip=0}
+  ' "$BASHRC" > "$BASHRC.xraycli.tmp" && mv "$BASHRC.xraycli.tmp" "$BASHRC"
+  ok "removed xraycli block from ~/.bashrc"
+}
+
+cmd_uninstall() {
+  local yes=0 keep=0 dolinger=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes)        yes=1 ;;
+      --keep-config)   keep=1 ;;
+      --disable-linger) dolinger=1 ;;
+      *) die "unknown uninstall option: $1" ;;
+    esac
+    shift
+  done
+
+  echo "This will remove xraycli and all of its data from your account:"
+  echo "  - stop & remove the user service ($SERVICE_NAME)"
+  echo "  - delete $DATA_DIR"
+  echo "  - delete $STATE_DIR"
+  [ "$keep" -eq 1 ] && echo "  - KEEP  $CONFIG_DIR (per --keep-config)" \
+                     || echo "  - delete $CONFIG_DIR"
+  echo "  - remove the xraycli block from ~/.bashrc"
+  echo "  - remove $BIN_SELF"
+  echo
+  if [ "$yes" -ne 1 ]; then
+    printf 'Proceed? [y/N] '
+    read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) echo "aborted."; return 0 ;; esac
+  fi
+
+  # 1) stop + disable service (both systemd and manual paths)
+  if have_systemd_user && service_installed; then
+    systemctl --user disable --now "$SERVICE_NAME" 2>/dev/null || true
+  fi
+  manual_stop 2>/dev/null || true
+  rm -f "$PID_FILE"
+
+  # 2) remove unit
+  if [ -f "$SERVICE_FILE" ]; then
+    rm -f "$SERVICE_FILE"
+    if have_systemd_user; then
+      systemctl --user daemon-reload 2>/dev/null || true
+      systemctl --user reset-failed "$SERVICE_NAME" 2>/dev/null || true
+    fi
+    ok "removed $SERVICE_FILE"
+  fi
+
+  # 3) data + state (+ config unless kept)
+  rm -rf "$DATA_DIR" && ok "removed $DATA_DIR"
+  rm -rf "$STATE_DIR" && ok "removed $STATE_DIR"
+  if [ "$keep" -eq 1 ]; then
+    warn "kept $CONFIG_DIR"
+  else
+    rm -rf "$CONFIG_DIR" && ok "removed $CONFIG_DIR"
+  fi
+
+  # 4) bashrc block
+  remove_bashrc_block
+
+  # 5) optionally disable linger (user-global; off by default)
+  if [ "$dolinger" -eq 1 ] && have loginctl; then
+    loginctl disable-linger "$(id -un)" 2>/dev/null && ok "disabled linger" || true
+  fi
+
+  # 6) remove self last (safe: inode stays alive until this process exits)
+  rm -f "$BIN_SELF" && ok "removed $BIN_SELF"
+
+  echo
+  ok "xraycli uninstalled. Open a new shell (or 'source ~/.bashrc') to drop the removed helpers."
+}
+
+cmd_help() {
+  cat <<EOF
+${c_bld}xraycli${c_rst} — user-scope Xray proxy manager (v$XRAYCLI_VERSION_SELF)
+
+${c_bld}Lifecycle${c_rst}
+  start                 start the proxy
+  stop                  stop the proxy
+  restart               restart the proxy
+  status                show status, ports, active node
+  enable                start now + on login (enables systemd linger)
+  disable               stop + do not start on login
+  log [service|error|access]   follow logs
+  test                  verify the proxy reaches the internet (prints egress IP)
+
+${c_bld}Nodes / subscription${c_rst}
+  add '<share-link>'    add a node from a share link          ${c_dim}(import: not wired yet)${c_rst}
+  sub set '<url>'       save a subscription URL
+  sub show|clear        show / clear the subscription URL
+  update                fetch + parse the subscription         ${c_dim}(import: not wired yet)${c_rst}
+  list                  list saved nodes ('*' = active)
+  use <index|name>      select the active node
+  remove <index|name>   delete a node
+  current               print the active node
+  direct                use no proxy node (pass-through)
+
+${c_bld}Config${c_rst}
+  port                  print the local proxy ports
+  config [show|path|edit|regen]   view / edit / rebuild config.json
+  version               print xraycli + xray versions
+
+${c_bld}Maintenance${c_rst}
+  uninstall [-y] [--keep-config] [--disable-linger]   remove everything cleanly
+  help                  this message
+
+Local proxies (after 'source ~/.bashrc'): ${c_dim}proxyon${c_rst} / ${c_dim}proxyoff${c_rst} toggle shell proxy env vars.
+EOF
+}
+
+# --------------------------------------------------------------------------- #
+#  Dispatch                                                                    #
+# --------------------------------------------------------------------------- #
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    start)            cmd_start "$@" ;;
+    stop)             cmd_stop "$@" ;;
+    restart)          cmd_restart "$@" ;;
+    status|st)        cmd_status "$@" ;;
+    enable)           cmd_enable "$@" ;;
+    disable)          cmd_disable "$@" ;;
+    log|logs)         cmd_log "$@" ;;
+    test)             cmd_test "$@" ;;
+    add)              cmd_add "$@" ;;
+    sub|subscribe)    cmd_sub "$@" ;;
+    update)           cmd_update "$@" ;;
+    list|ls)          cmd_list "$@" ;;
+    use|select)       cmd_use "$@" ;;
+    remove|rm|del)    cmd_remove "$@" ;;
+    current)          cmd_current "$@" ;;
+    direct)           cmd_direct "$@" ;;
+    port|ports)       cmd_port "$@" ;;
+    config|conf)      cmd_config "$@" ;;
+    regen|_regen)     cmd_regen "$@"; ok "regenerated config" ;;
+    version|-v|--version) cmd_version "$@" ;;
+    uninstall|remove-all) cmd_uninstall "$@" ;;
+    help|-h|--help|"") cmd_help ;;
+    *) die "unknown command: $cmd  (try: xraycli help)" ;;
+  esac
+}
+main "$@"

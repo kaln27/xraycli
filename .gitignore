@@ -1,0 +1,16 @@
+# xraycli is a template/installer repo — no build artifacts are tracked.
+# Anything a contributor might drop while testing locally:
+*.zip
+*.log
+*.tmp
+*.bak
+/core/
+/dist/
+/tmp/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
