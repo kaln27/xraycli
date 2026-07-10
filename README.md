@@ -34,15 +34,30 @@ xraycli     →  start / stop / restart / status / enable / logs / nodes / unins
 
 ## Install
 
-From a checkout of this repo:
+### One line (recommended)
 
 ```bash
-git clone <this-repo-url> xraycli
+bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh)
+```
+
+That single command bootstraps everything: it installs missing dependencies
+(`curl`/`unzip`/`jq`) if a package manager is available, downloads the right
+Xray-core for your CPU, fetches the `xraycli` control script, picks free ports,
+and sets up the user service. No `git clone` needed. Pass installer options
+straight through, e.g. `… /install.sh) --no-service`.
+
+> Prefer `bash <(curl …)` over `curl … | bash` — it keeps your terminal on
+> stdin, so confirmation prompts still work.
+
+### From a checkout
+
+```bash
+git clone https://github.com/kaln27/xraycli.git
 cd xraycli
 ./install.sh
 ```
 
-Then reload your shell so `PATH` and the helpers apply:
+Either way, reload your shell so `PATH` and the helpers apply:
 
 ```bash
 source ~/.bashrc
@@ -58,6 +73,7 @@ source ~/.bashrc
 | `--listen ADDR` | Local listen address (default: `127.0.0.1`) |
 | `--no-service` | Skip installing/enabling the systemd user service |
 | `--no-bashrc` | Do not modify `~/.bashrc` |
+| `--no-deps` | Do not auto-install missing dependencies |
 | `--mirror PREFIX` | Prefix prepended to the GitHub download URL (for CN mirrors) |
 
 ---

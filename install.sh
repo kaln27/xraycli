@@ -37,6 +37,12 @@ set -euo pipefail
 readonly APP="xraycli"
 readonly XRAY_REPO="XTLS/Xray-core"
 
+# This project's repo — used to fetch the control script when install.sh is run
+# piped (e.g. `bash <(curl -Ls .../install.sh)`) with no local checkout.
+readonly REPO_SLUG="kaln27/xraycli"
+readonly REPO_BRANCH="main"
+: "${XRAYCLI_RAW_BASE:=https://raw.githubusercontent.com/$REPO_SLUG/$REPO_BRANCH}"
+
 : "${XDG_DATA_HOME:=$HOME/.local/share}"
 : "${XDG_CONFIG_HOME:=$HOME/.config}"
 : "${XDG_STATE_HOME:=$HOME/.local/state}"
@@ -51,7 +57,9 @@ readonly ENV_FILE="$CONFIG_DIR/xraycli.env"
 readonly SERVICE_NAME="$APP.service"
 readonly BASHRC="$HOME/.bashrc"
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Tolerant of piped execution (bash <(curl …)), where BASH_SOURCE is a pipe and
+# there is no local checkout — SCRIPT_DIR ends up empty and we fetch remotely.
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
 
 # --------------------------------------------------------------------------- #
 #  Defaults / CLI options                                                     #
@@ -62,6 +70,7 @@ PREF_HTTP_PORT=10809
 LISTEN_ADDR="127.0.0.1"
 DO_SERVICE=1
 DO_BASHRC=1
+DO_DEPS=1
 MIRROR=""
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +87,31 @@ ok()    { printf '%s ✓ %s %s\n' "$c_grn"  "$c_rst" "$*"; }
 warn()  { printf '%s ! %s %s\n' "$c_ylw"  "$c_rst" "$*" >&2; }
 die()   { printf '%s ✗ %s %s\n' "$c_red"  "$c_rst" "$*" >&2; exit 1; }
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() {
+  cat <<'EOF'
+install.sh — user-scope installer for xraycli (an Xray-core proxy manager)
+
+Everything is installed under your $HOME; no system files are touched. The only
+system-level action is auto-installing missing common tools (curl/unzip/jq) when
+a package manager is available.
+
+Usage:
+  ./install.sh [options]
+  bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh) [options]
+
+Options:
+  --version <vX.Y.Z>   Install a specific Xray-core version (default: latest)
+  --socks-port <n>     Preferred SOCKS port   (default: auto, from 10808)
+  --http-port  <n>     Preferred HTTP  port   (default: auto, from 10809)
+  --listen <addr>      Local listen address   (default: 127.0.0.1)
+  --no-service         Do not install/enable the systemd user service
+  --no-bashrc          Do not modify ~/.bashrc
+  --no-deps            Do not attempt to install missing dependencies
+  --mirror <prefix>    Prefix prepended to the GitHub download URL (CN mirrors)
+  -h, --help           Show this help
+EOF
+  exit "${1:-0}"
+}
 
 # --------------------------------------------------------------------------- #
 #  Argument parsing                                                           #
@@ -92,6 +125,7 @@ while [ $# -gt 0 ]; do
     --mirror)     MIRROR="${2:?}"; shift 2 ;;
     --no-service) DO_SERVICE=0; shift ;;
     --no-bashrc)  DO_BASHRC=0; shift ;;
+    --no-deps)    DO_DEPS=0; shift ;;
     -h|--help)    usage 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -117,6 +151,51 @@ download() {  # download <url> <dest>
   else
     die "need curl or wget to download files"
   fi
+}
+
+fetch_stdout() {  # fetch_stdout <url> -> stdout
+  if have curl; then curl -fsSL --retry 3 --connect-timeout 20 "$1"
+  elif have wget; then wget -qO- "$1"
+  else return 1; fi
+}
+
+# Install packages via whatever system package manager exists. Uses sudo only if
+# not root and sudo is available. Returns non-zero if it cannot install.
+pkg_install() {
+  local pkgs="$*" sudo=""
+  [ "$(id -u)" -ne 0 ] && have sudo && sudo="sudo"
+  if   have apt-get; then $sudo apt-get update -y >/dev/null 2>&1; $sudo apt-get install -y $pkgs
+  elif have dnf;     then $sudo dnf install -y $pkgs
+  elif have yum;     then $sudo yum install -y $pkgs
+  elif have zypper;  then $sudo zypper --non-interactive install $pkgs
+  elif have pacman;  then $sudo pacman -Sy --noconfirm $pkgs
+  elif have apk;     then $sudo apk add $pkgs
+  elif have brew;    then brew install $pkgs
+  else return 1; fi
+}
+
+# Ensure the tools xraycli needs are present. unzip + a downloader are hard
+# requirements at install time; jq is only needed later (subscriptions/nodes),
+# so a missing jq is a warning, not fatal.
+ensure_deps() {
+  info "Checking dependencies"
+  local missing=()
+  have curl || have wget || missing+=(curl)
+  have unzip || missing+=(unzip)
+  have jq    || missing+=(jq)
+  if [ "${#missing[@]}" -eq 0 ]; then ok "all dependencies present"; return 0; fi
+
+  if [ "$DO_DEPS" -eq 1 ]; then
+    warn "missing: ${missing[*]} — attempting to install via the system package manager"
+    if pkg_install "${missing[@]}"; then ok "dependencies installed"
+    else warn "auto-install failed (no known package manager, or no permission)"; fi
+  else
+    warn "missing: ${missing[*]} (auto-install disabled via --no-deps)"
+  fi
+
+  have curl || have wget || die "curl or wget is required — please install one and re-run"
+  have unzip || die "unzip is required to extract Xray — please install it and re-run"
+  have jq    || warn "jq not installed: subscription/node commands will need it (install jq later)"
 }
 
 port_in_use() {  # returns 0 when <port> is already listening
@@ -167,9 +246,8 @@ detect_asset() {  # echoes the Xray release asset name for this machine
 # --------------------------------------------------------------------------- #
 preflight() {
   info "Preflight checks"
-  have unzip || die "unzip is required (install it with your package manager)"
-  have curl || have wget || die "curl or wget is required"
   [ -n "$HOME" ] || die "\$HOME is not set"
+  ensure_deps
   if [ "$DO_SERVICE" -eq 1 ]; then
     if ! have systemctl; then
       warn "systemctl not found — skipping service install (use 'xraycli start')"
@@ -235,14 +313,16 @@ EOF
 install_script() {
   info "Installing xraycli control script"
   mkdir -p "$BIN_DIR"
-  local src="$SCRIPT_DIR/bin/xraycli"
-  if [ -f "$src" ]; then
-    install -m 0755 "$src" "$BIN_DIR/xraycli"
-  elif [ -n "${XRAYCLI_RAW_BASE:-}" ]; then
-    download "$XRAYCLI_RAW_BASE/bin/xraycli" "$BIN_DIR/xraycli"
-    chmod 0755 "$BIN_DIR/xraycli"
+  local src="${SCRIPT_DIR:-}/bin/xraycli"
+  if [ -n "${SCRIPT_DIR:-}" ] && [ -f "$src" ]; then
+    install -m 0755 "$src" "$BIN_DIR/xraycli"       # local checkout
   else
-    die "bin/xraycli not found next to install.sh (run from a repo checkout)"
+    info "no local checkout — fetching from $XRAYCLI_RAW_BASE/bin/xraycli"
+    download "$XRAYCLI_RAW_BASE/bin/xraycli" "$BIN_DIR/xraycli" \
+      || die "could not download the control script from $XRAYCLI_RAW_BASE/bin/xraycli"
+    head -1 "$BIN_DIR/xraycli" | grep -q '^#!' \
+      || die "downloaded control script looks invalid (got HTML? check the URL/branch)"
+    chmod 0755 "$BIN_DIR/xraycli"
   fi
   ok "installed $BIN_DIR/xraycli"
 }
