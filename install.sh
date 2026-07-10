@@ -338,28 +338,13 @@ generate_config() {
 install_service() {
   [ "$DO_SERVICE" -eq 1 ] || { warn "skipping systemd service (per --no-service)"; return 0; }
   info "Installing user systemd service"
-  mkdir -p "$SYSTEMD_DIR"
-  cat > "$SYSTEMD_DIR/$SERVICE_NAME" <<EOF
-[Unit]
-Description=Xray proxy (managed by xraycli)
-Documentation=https://github.com/XTLS/Xray-core
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=XRAY_LOCATION_ASSET=%h/.local/share/$APP/core
-ExecStart=%h/.local/share/$APP/core/xray run -config %h/.config/$APP/config.json
-Restart=on-failure
-RestartSec=5
-# Light user-scope hardening (kept minimal to avoid surprising failures)
-NoNewPrivileges=true
-
-[Install]
-WantedBy=default.target
-EOF
-  systemctl --user daemon-reload 2>/dev/null || warn "systemctl --user daemon-reload failed (is a user session bus running?)"
-  ok "installed $SYSTEMD_DIR/$SERVICE_NAME"
+  # Delegate to the control script so the unit lands in the directory the --user
+  # manager actually scans (which may differ from \$HOME) and uses absolute paths.
+  if "$BIN_DIR/xraycli" service install >/dev/null 2>&1; then
+    ok "installed user service unit"
+  else
+    warn "could not install the service unit — you can still use 'xraycli start'"
+  fi
 }
 
 patch_bashrc() {

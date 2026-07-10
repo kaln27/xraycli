@@ -35,9 +35,12 @@ readonly CORE_DIR="$DATA_DIR/core"
 readonly CORE_BIN="$CORE_DIR/xray"
 readonly CONFIG_DIR="$XDG_CONFIG_HOME/$APP"
 readonly STATE_DIR="$XDG_STATE_HOME/$APP"
-readonly SYSTEMD_DIR="$XDG_CONFIG_HOME/systemd/user"
 readonly SERVICE_NAME="$APP.service"
-readonly SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
+# SYSTEMD_DIR/SERVICE_FILE are resolved at runtime by init_systemd_paths(): the
+# --user manager may run with a different HOME than this shell (e.g. root with a
+# custom $HOME), so we must target the directory the manager actually scans.
+SYSTEMD_DIR="$XDG_CONFIG_HOME/systemd/user"
+SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
 
 readonly ENV_FILE="$CONFIG_DIR/xraycli.env"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
@@ -94,6 +97,23 @@ have_systemd_user() { have systemctl && systemctl --user show-environment >/dev/
 service_installed() { [ -f "$SERVICE_FILE" ]; }
 use_systemd() { service_installed && have_systemd_user; }
 
+# The --user manager searches units relative to ITS OWN environment. When this
+# shell's $HOME differs from the manager's (e.g. root logged in with a custom
+# HOME), $HOME/.config/systemd/user is NOT scanned. Resolve the real directory
+# from the manager's exported HOME/XDG_CONFIG_HOME so units land where it looks.
+init_systemd_paths() {
+  local env xdg home
+  if have systemctl; then
+    env="$(systemctl --user show-environment 2>/dev/null)" || env=""
+    xdg="$(printf '%s\n' "$env" | sed -n 's/^XDG_CONFIG_HOME=//p' | head -1)"
+    home="$(printf '%s\n' "$env" | sed -n 's/^HOME=//p' | head -1)"
+  fi
+  if   [ -n "${xdg:-}" ];  then SYSTEMD_DIR="$xdg/systemd/user"
+  elif [ -n "${home:-}" ]; then SYSTEMD_DIR="$home/.config/systemd/user"
+  else                          SYSTEMD_DIR="$XDG_CONFIG_HOME/systemd/user"; fi
+  SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
+}
+
 is_running() {
   if use_systemd; then
     systemctl --user is-active --quiet "$SERVICE_NAME"
@@ -104,6 +124,8 @@ is_running() {
 
 write_service_unit() {
   mkdir -p "$SYSTEMD_DIR"
+  # Absolute paths (NOT %h): xraycli's files live under this shell's $HOME, which
+  # may differ from the manager's home that %h would expand to.
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Xray proxy (managed by xraycli)
@@ -113,8 +135,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=XRAY_LOCATION_ASSET=%h/.local/share/$APP/core
-ExecStart=%h/.local/share/$APP/core/xray run -config %h/.config/$APP/config.json
+Environment=XRAY_LOCATION_ASSET=$CORE_DIR
+ExecStart=$CORE_BIN run -config $CONFIG_FILE
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -225,7 +247,13 @@ cmd_start() {
   ensure_installed
   [ -f "$CONFIG_FILE" ] || cmd_regen
   if use_systemd; then
-    systemctl --user start "$SERVICE_NAME" && ok "started (systemd user service)"
+    systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user start "$SERVICE_NAME" 2>/dev/null; then
+      ok "started (systemd user service)"
+    else
+      warn "systemd could not start the unit — running as a background process instead"
+      manual_start
+    fi
   else
     manual_start
   fi
@@ -242,7 +270,9 @@ cmd_stop() {
 cmd_restart() {
   ensure_installed
   if use_systemd; then
-    systemctl --user restart "$SERVICE_NAME" && ok "restarted"
+    systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user restart "$SERVICE_NAME" 2>/dev/null; then ok "restarted"
+    else warn "systemd restart failed — using a background process"; manual_stop; manual_start; fi
   else
     manual_stop; manual_start
   fi
@@ -250,15 +280,26 @@ cmd_restart() {
 
 cmd_enable() {
   ensure_installed
-  service_installed || write_service_unit
-  have_systemd_user || die "no user systemd session — cannot enable a service (use 'xraycli start')"
+  [ -f "$CONFIG_FILE" ] || cmd_regen
+  # (re)write the unit so it lands in the manager's real scan dir with absolute paths
+  write_service_unit
+  if ! have_systemd_user; then
+    warn "no user systemd session — starting as a background process instead"
+    manual_start; return
+  fi
   # Make the service survive logout.
   if have loginctl; then
     loginctl enable-linger "$(id -un)" 2>/dev/null \
       && ok "enabled linger (service runs even when logged out)" \
       || warn "could not enable linger (service may stop on logout)"
   fi
-  systemctl --user enable --now "$SERVICE_NAME" && ok "enabled + started on login"
+  systemctl --user daemon-reload 2>/dev/null || true
+  if systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then
+    ok "enabled + started on login"
+  else
+    warn "systemd enable failed — running as a background process instead"
+    manual_start
+  fi
 }
 
 cmd_disable() {
@@ -922,6 +963,7 @@ EOF
 #  Dispatch                                                                    #
 # --------------------------------------------------------------------------- #
 main() {
+  init_systemd_paths
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
     start)            cmd_start "$@" ;;
@@ -943,6 +985,10 @@ main() {
     direct)           cmd_direct "$@" ;;
     port|ports)       cmd_port "$@" ;;
     config|conf)      cmd_config "$@" ;;
+    service)          case "${1:-}" in
+                        install) write_service_unit; ok "installed service unit -> $SERVICE_FILE" ;;
+                        *) die "usage: xraycli service install" ;;
+                      esac ;;
     regen|_regen)     cmd_regen "$@"; ok "regenerated config" ;;
     version|-v|--version) cmd_version "$@" ;;
     uninstall|remove-all) cmd_uninstall "$@" ;;
