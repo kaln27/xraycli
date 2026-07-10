@@ -49,7 +49,12 @@ readonly ACTIVE_OUTBOUND="$CONFIG_DIR/active_outbound.json"
 readonly ACTIVE_NAME_FILE="$CONFIG_DIR/active_name"
 readonly SUB_FILE="$CONFIG_DIR/subscription"
 readonly PID_FILE="$STATE_DIR/xray.pid"
+readonly SUPERVISOR_PID="$STATE_DIR/supervisor.pid"
 readonly BASHRC="$HOME/.bashrc"
+readonly CRON_TAG="# xraycli-autostart"
+
+# Filled in by init_service_mode(): "systemd" or "self".
+SERVICE_MODE="self"
 
 # --------------------------------------------------------------------------- #
 #  Output helpers                                                             #
@@ -95,7 +100,7 @@ core_version() {
 # --------------------------------------------------------------------------- #
 have_systemd_user() { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }
 service_installed() { [ -f "$SERVICE_FILE" ]; }
-use_systemd() { service_installed && have_systemd_user; }
+use_systemd() { [ "$SERVICE_MODE" = systemd ]; }
 
 # The --user manager searches units relative to ITS OWN environment. When this
 # shell's $HOME differs from the manager's (e.g. root logged in with a custom
@@ -114,11 +119,23 @@ init_systemd_paths() {
   SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
 }
 
+# Decide how to run the service. Use systemd ONLY when its user-unit directory
+# lives under this $HOME (so nothing lands outside the user's home, e.g. /root).
+# Otherwise, and when XRAYCLI_NO_SYSTEMD=1, run a self-managed supervisor — the
+# whole service then stays under $HOME with no external footprint.
+init_service_mode() {
+  SERVICE_MODE="self"
+  [ "${XRAYCLI_NO_SYSTEMD:-0}" = 1 ] && return
+  if have_systemd_user; then
+    case "$SYSTEMD_DIR/" in "$HOME"/*) SERVICE_MODE="systemd" ;; esac
+  fi
+}
+
 is_running() {
   if use_systemd; then
     systemctl --user is-active --quiet "$SERVICE_NAME"
   else
-    [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+    sm_running
   fi
 }
 
@@ -147,24 +164,65 @@ EOF
   have_systemd_user && systemctl --user daemon-reload 2>/dev/null || true
 }
 
-manual_start() {
-  is_running && { warn "already running (pid $(cat "$PID_FILE"))"; return 0; }
+# ---- self-managed supervisor (no systemd; everything under $HOME) -------- #
+sm_running() { [ -f "$SUPERVISOR_PID" ] && kill -0 "$(cat "$SUPERVISOR_PID" 2>/dev/null)" 2>/dev/null; }
+
+# Internal: runs xray in a loop, restarting it on crash until signalled to stop.
+cmd_supervise() {
+  load_env
   mkdir -p "$STATE_DIR"
-  XRAY_LOCATION_ASSET="$CORE_DIR" nohup "$CORE_BIN" run -config "$CONFIG_FILE" \
-    >>"$STATE_DIR/error.log" 2>&1 &
-  echo $! > "$PID_FILE"
-  sleep 1
-  if is_running; then ok "started (pid $(cat "$PID_FILE"), no systemd)"
+  echo "$$" > "$SUPERVISOR_PID"
+  local xpid=""
+  _sv_term() { [ -n "$xpid" ] && kill "$xpid" 2>/dev/null; rm -f "$PID_FILE" "$SUPERVISOR_PID"; exit 0; }
+  trap _sv_term TERM INT
+  while :; do
+    XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" run -config "$CONFIG_FILE" >>"$STATE_DIR/error.log" 2>&1 &
+    xpid=$!; echo "$xpid" > "$PID_FILE"
+    wait "$xpid"           # returns when xray exits, or is interrupted by a trap
+    sleep 2                # throttle restarts on a crash loop
+  done
+}
+
+sm_start() {
+  is_running && { warn "already running (pid $(cat "$PID_FILE" 2>/dev/null))"; return 0; }
+  ensure_installed
+  mkdir -p "$STATE_DIR"; rm -f "$SUPERVISOR_PID"
+  setsid "$BIN_SELF" __supervise >>"$STATE_DIR/error.log" 2>&1 < /dev/null &
+  local i
+  for (( i=0; i<10; i++ )); do sm_running && break; sleep 0.3; done
+  sleep 0.4
+  if is_running; then ok "started (self-managed, supervisor pid $(cat "$SUPERVISOR_PID" 2>/dev/null))"
   else die "failed to start — check $STATE_DIR/error.log"; fi
 }
 
-manual_stop() {
-  if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null && ok "stopped"
+sm_stop() {
+  local spid i
+  if sm_running; then
+    spid="$(cat "$SUPERVISOR_PID")"
+    kill "$spid" 2>/dev/null
+    for (( i=0; i<24; i++ )); do kill -0 "$spid" 2>/dev/null || break; sleep 0.25; done
+    kill -0 "$spid" 2>/dev/null && kill -9 "$spid" 2>/dev/null
+    ok "stopped"
   else
     warn "not running"
   fi
-  rm -f "$PID_FILE"
+  [ -f "$PID_FILE" ] && kill "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+  rm -f "$PID_FILE" "$SUPERVISOR_PID"
+}
+
+# ---- boot autostart for self-managed mode (crontab @reboot) -------------- #
+# cron runs jobs with HOME from /etc/passwd, so we pin HOME to this install's.
+cron_enable() {
+  have crontab || { warn "cron not found — no boot autostart; run 'xraycli start' after boot"; return 1; }
+  local line="@reboot HOME=$HOME $BIN_SELF start >/dev/null 2>&1 $CRON_TAG"
+  { crontab -l 2>/dev/null | grep -vF "$CRON_TAG"; printf '%s\n' "$line"; } | crontab - 2>/dev/null \
+    && ok "boot autostart enabled (crontab @reboot)" \
+    || warn "could not update crontab"
+}
+cron_disable() {
+  have crontab || return 0
+  local cur; cur="$(crontab -l 2>/dev/null | grep -vF "$CRON_TAG")"
+  printf '%s\n' "$cur" | grep -q . && printf '%s\n' "$cur" | crontab - 2>/dev/null || crontab -r 2>/dev/null || true
 }
 
 restart_if_running() { if is_running; then cmd_restart; fi; }
@@ -251,11 +309,11 @@ cmd_start() {
     if systemctl --user start "$SERVICE_NAME" 2>/dev/null; then
       ok "started (systemd user service)"
     else
-      warn "systemd could not start the unit — running as a background process instead"
-      manual_start
+      warn "systemd could not start the unit — using the self-managed supervisor instead"
+      sm_start
     fi
   else
-    manual_start
+    sm_start
   fi
 }
 
@@ -263,7 +321,7 @@ cmd_stop() {
   if use_systemd; then
     systemctl --user stop "$SERVICE_NAME" && ok "stopped"
   else
-    manual_stop
+    sm_stop
   fi
 }
 
@@ -272,61 +330,63 @@ cmd_restart() {
   if use_systemd; then
     systemctl --user daemon-reload 2>/dev/null || true
     if systemctl --user restart "$SERVICE_NAME" 2>/dev/null; then ok "restarted"
-    else warn "systemd restart failed — using a background process"; manual_stop; manual_start; fi
+    else warn "systemd restart failed — using the self-managed supervisor"; sm_stop; sm_start; fi
   else
-    manual_stop; manual_start
+    sm_stop; sm_start
   fi
 }
 
 cmd_enable() {
   ensure_installed
   [ -f "$CONFIG_FILE" ] || cmd_regen
-  # (re)write the unit so it lands in the manager's real scan dir with absolute paths
-  write_service_unit
-  if ! have_systemd_user; then
-    warn "no user systemd session — starting as a background process instead"
-    manual_start; return
+  if use_systemd; then
+    write_service_unit
+    if have loginctl; then
+      loginctl enable-linger "$(id -un)" 2>/dev/null \
+        && ok "enabled linger (service runs even when logged out)" \
+        || warn "could not enable linger (service may stop on logout)"
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then
+      ok "enabled + started on login"; return
+    fi
+    warn "systemd enable failed — falling back to the self-managed supervisor"
   fi
-  # Make the service survive logout.
-  if have loginctl; then
-    loginctl enable-linger "$(id -un)" 2>/dev/null \
-      && ok "enabled linger (service runs even when logged out)" \
-      || warn "could not enable linger (service may stop on logout)"
-  fi
-  systemctl --user daemon-reload 2>/dev/null || true
-  if systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then
-    ok "enabled + started on login"
-  else
-    warn "systemd enable failed — running as a background process instead"
-    manual_start
-  fi
+  # self-managed: boot autostart via crontab @reboot, then start now
+  cron_enable
+  sm_start
 }
 
 cmd_disable() {
   if use_systemd; then
     systemctl --user disable --now "$SERVICE_NAME" 2>/dev/null && ok "disabled + stopped"
+    warn "note: user 'linger' is left enabled (user-global). Disable with: loginctl disable-linger $(id -un)"
   else
-    manual_stop
+    cron_disable && ok "boot autostart removed"
+    sm_stop
   fi
-  warn "note: user 'linger' is left enabled (it is user-global). Disable with: loginctl disable-linger $(id -un)"
 }
 
 cmd_status() {
   load_env
-  local running node
+  local running node mode
   node="$(current_name)"; [ -n "$node" ] || node="(direct — no proxy node)"
   is_running && running="${c_grn}running${c_rst}" || running="${c_red}stopped${c_rst}"
+  if use_systemd; then mode="systemd user service"; else mode="self-managed supervisor (auto-restart)"; fi
   printf '%s%s%s\n' "$c_bld" "$APP status" "$c_rst"
   printf '  version : xraycli %s  /  xray %s\n' "$XRAYCLI_VERSION_SELF" "$(core_version)"
   printf '  listen  : %s   socks %s   http %s\n' "$LISTEN" "$SOCKS_PORT" "$HTTP_PORT"
   printf '  node    : %s\n' "$node"
   printf '  running : %b\n' "$running"
-  printf '  mode    : %s\n' "$(use_systemd && echo 'systemd user service' || echo 'manual process')"
+  printf '  mode    : %s\n' "$mode"
   echo
   if use_systemd; then
     systemctl --user status "$SERVICE_NAME" --no-pager -l 2>/dev/null | sed 's/^/  /' || true
-  elif [ -f "$PID_FILE" ]; then
-    printf '  pid     : %s\n' "$(cat "$PID_FILE")"
+  else
+    printf '  unit    : none (controlled by xraycli under %s)\n' "$STATE_DIR"
+    [ -f "$SUPERVISOR_PID" ] && printf '  supervisor pid : %s\n' "$(cat "$SUPERVISOR_PID")"
+    [ -f "$PID_FILE" ] && printf '  xray pid       : %s\n' "$(cat "$PID_FILE")"
+    have crontab && crontab -l 2>/dev/null | grep -qF "$CRON_TAG" && printf '  boot autostart : enabled (crontab @reboot)\n' || true
   fi
 }
 
@@ -879,21 +939,26 @@ cmd_uninstall() {
     case "$ans" in y|Y|yes|YES) ;; *) echo "aborted."; return 0 ;; esac
   fi
 
-  # 1) stop + disable service (both systemd and manual paths)
-  if have_systemd_user && service_installed; then
+  # 1) stop everything (self-managed supervisor + any systemd service)
+  sm_stop 2>/dev/null || true
+  cron_disable 2>/dev/null || true
+  if have_systemd_user; then
     systemctl --user disable --now "$SERVICE_NAME" 2>/dev/null || true
   fi
-  manual_stop 2>/dev/null || true
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$SUPERVISOR_PID"
 
-  # 2) remove unit
-  if [ -f "$SERVICE_FILE" ]; then
-    rm -f "$SERVICE_FILE"
+  # 2) remove the systemd unit from every place it may have been written
+  #    (the manager's resolved dir AND this $HOME's XDG dir, from older versions).
+  local u removed=0
+  for u in "$SERVICE_FILE" "$XDG_CONFIG_HOME/systemd/user/$SERVICE_NAME"; do
+    [ -e "$u" ] && { rm -f "$u"; removed=1; }
+  done
+  if [ "$removed" -eq 1 ]; then
     if have_systemd_user; then
       systemctl --user daemon-reload 2>/dev/null || true
       systemctl --user reset-failed "$SERVICE_NAME" 2>/dev/null || true
     fi
-    ok "removed $SERVICE_FILE"
+    ok "removed systemd unit(s)"
   fi
 
   # 3) data + state (+ config unless kept)
@@ -929,8 +994,8 @@ ${c_bld}Lifecycle${c_rst}
   stop                  stop the proxy
   restart               restart the proxy
   status                show status, ports, active node
-  enable                start now + on login (enables systemd linger)
-  disable               stop + do not start on login
+  enable                start now + auto-start on boot (systemd, or crontab @reboot)
+  disable               stop + remove boot auto-start
   log [service|error|access]   follow logs
   test                  verify the proxy reaches the internet (prints egress IP)
 
@@ -964,8 +1029,10 @@ EOF
 # --------------------------------------------------------------------------- #
 main() {
   init_systemd_paths
+  init_service_mode
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
+    __supervise)      cmd_supervise ;;
     start)            cmd_start "$@" ;;
     stop)             cmd_stop "$@" ;;
     restart)          cmd_restart "$@" ;;
@@ -986,7 +1053,9 @@ main() {
     port|ports)       cmd_port "$@" ;;
     config|conf)      cmd_config "$@" ;;
     service)          case "${1:-}" in
-                        install) write_service_unit; ok "installed service unit -> $SERVICE_FILE" ;;
+                        install)
+                          if use_systemd; then write_service_unit; ok "installed service unit -> $SERVICE_FILE"
+                          else ok "self-managed mode: no systemd unit (all under $HOME); use 'xraycli enable' for boot autostart"; fi ;;
                         *) die "usage: xraycli service install" ;;
                       esac ;;
     regen|_regen)     cmd_regen "$@"; ok "regenerated config" ;;

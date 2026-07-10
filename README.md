@@ -134,7 +134,33 @@ Or configure an app directly with the ports shown by `xraycli port`
 | `~/.config/xraycli/nodes.json` | saved server nodes |
 | `~/.config/xraycli/active_outbound.json` | outbound used by the active node |
 | `~/.local/state/xraycli/*.log` | access / error logs |
-| `~/.config/systemd/user/xraycli.service` | the user service unit |
+| `~/.config/systemd/user/xraycli.service` | the user service unit *(systemd mode only)* |
+
+---
+
+## How the service runs (systemd vs self-managed)
+
+`enable`/`start` pick a control method automatically:
+
+- **systemd user service** — used when the systemd `--user` manager's unit
+  directory is under your `$HOME`. `enable` writes `xraycli.service`, turns on
+  linger, and starts on boot. This is the normal case.
+- **self-managed supervisor** — used when systemd isn't available, or when its
+  unit directory is **not** under your `$HOME` (e.g. you're `root` with a custom
+  `$HOME`, so the manager only scans `/root/.config/systemd/user`). Instead of
+  writing anything outside your home, xraycli runs Xray under its own small
+  supervisor (restarts it if it crashes) with **everything kept under `$HOME`**:
+
+  | Path | Contents |
+  | --- | --- |
+  | `~/.local/state/xraycli/supervisor.pid` | the supervisor process |
+  | `~/.local/state/xraycli/xray.pid` | the running Xray process |
+  | crontab `@reboot` entry (tagged `# xraycli-autostart`) | boot auto-start |
+
+  Force this mode anywhere with `XRAYCLI_NO_SYSTEMD=1`.
+
+Both modes present the identical `start`/`stop`/`restart`/`status`/`enable`/
+`disable` interface, and `uninstall` cleans up whichever was used.
 
 ---
 

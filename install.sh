@@ -394,15 +394,14 @@ summary() {
   echo "  Logs           : $STATE_DIR/{access,error}.log"
   echo "  SOCKS proxy    : $LISTEN_ADDR:$socks"
   echo "  HTTP  proxy    : $LISTEN_ADDR:$http"
-  [ "$DO_SERVICE" -eq 1 ] && echo "  Service        : systemctl --user … $SERVICE_NAME"
   echo
   echo "Next steps:"
   echo "  1) Reload your shell so PATH + helpers apply:   source ~/.bashrc"
-  echo "  2) Add a server node (share link / subscription — coming once configured):"
+  echo "  2) Add a node from a share link or subscription (base64 or Clash):"
   echo "         xraycli add   '<share-link>'"
   echo "         xraycli sub set '<subscription-url>' && xraycli update"
   echo "  3) Start it and check status:"
-  echo "         xraycli enable      # start now + start on login (enables linger)"
+  echo "         xraycli enable      # start now + auto-start on boot"
   echo "         xraycli status"
   echo "  4) Point your shell at the proxy:               proxyon   (proxyoff to stop)"
   echo
