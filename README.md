@@ -122,29 +122,42 @@ Or configure an app directly with the ports shown by `xraycli port`
 
 ---
 
-## Subscriptions & node import — not wired up yet
+## Subscriptions & node import
 
-The lifecycle, service, ports, config generation, and node **management**
-(`list` / `use` / `remove` / `current` / `direct`) are fully functional. The
-only intentionally-empty part is turning a **share link** or a **subscription**
-into node entries, because the exact format hasn't been decided yet.
+`update` / `import` **auto-detect** the subscription shape from its content
+(not from the URL), so the same command handles both formats:
 
-When you're ready, the integration points are:
+| Format | What it looks like | How it's parsed |
+| --- | --- | --- |
+| **base64 / raw** | a (base64-wrapped) list of `vless://`, `vmess://`, `trojan://`, `ss://` links | decoded, one node per link |
+| **Clash** | a YAML doc with a `proxies:` list | each proxy under `proxies:` becomes a node |
 
-- `parse_share_link()` in `bin/xraycli` — takes a `vmess://` / `vless://` /
-  `trojan://` / `ss://` URI and prints one node object.
-- `parse_subscription()` in `bin/xraycli` — fetches the subscription URL and
-  prints a JSON array of node objects.
-
-Each node object just needs this shape (everything else already consumes it):
-
-```json
-{ "name": "my-node", "outbound": { /* a valid Xray outbound object */ } }
+```bash
+xraycli sub set 'https://example.com/sub/xxxx'   # save your subscription URL
+xraycli update                                    # fetch + rebuild the node list
+# or one-off, without saving:
+xraycli import 'https://example.com/clash/xxxx'
+xraycli import ./my-nodes.txt                      # also works on a local file
+xraycli add 'vless://…#my-node'                    # add a single share link
 ```
 
-Tell the maintainer the **subscription type** (base64 link-list, Clash YAML,
-SIP008, …) and the **node protocols** you use, and these two functions get
-filled in — no other code changes required.
+`update` replaces the node list from the subscription and keeps your previously
+active node selected if it still exists (REALITY `shortId`/`spiderX` that rotate
+per fetch are picked up automatically); otherwise it selects the first node.
+
+### Supported node protocols
+
+Xray-core runs **VLESS** (incl. REALITY + XTLS-Vision), **VMess**, **Trojan**,
+and **Shadowsocks**, over `tcp` / `ws` / `grpc` / `h2` with `tls` / `reality`.
+
+Protocols Xray-core has **no outbound for** — `hysteria2`, `tuic`, `wireguard`,
+`ssr`, … — are recognised and **skipped** on import with a clear report (and
+refused by `add`), rather than silently breaking the config. If your
+subscription mixes, say, a VLESS and a hysteria2 node, only the VLESS one is
+imported and you'll see `skipped 1 node(s) …`.
+
+Each stored node has the shape `{ "name": …, "outbound": { …Xray outbound… } }`
+in `~/.config/xraycli/nodes.json`.
 
 ---
 

@@ -390,36 +390,389 @@ cmd_direct() {
   ok "switched to direct (traffic bypasses any proxy node)"
 }
 
-# ---- subscription / share-link import ----------------------------------- #
-#
-# NOTE: the actual parsing is intentionally left as a stub. Once the target
-# subscription format and node types are known, implement the two functions
-# below; every other command (list/use/remove/current/direct) already works
-# against nodes.json, so importers only need to produce entries of the shape:
-#
-#     { "name": "<label>", "outbound": { <a valid Xray outbound object> } }
-#
-# and append/replace them in nodes.json.
-#
-parse_share_link() {  # parse_share_link <uri>  ->  TODO: echo a node JSON object
-  return 3  # not implemented yet
+# --------------------------------------------------------------------------- #
+#  Subscription / share-link import                                           #
+#                                                                             #
+#  Two subscription shapes are auto-detected by content (not by URL):         #
+#    * base64 / raw : a (base64-wrapped) list of vless://, trojan://, … links #
+#    * clash        : a YAML doc whose nodes live under the `proxies:` key     #
+#  Each parser normalises a node into a "descriptor" JSON, and build_outbound  #
+#  turns a descriptor into a real Xray outbound. Protocols Xray-core cannot    #
+#  run (hysteria2, tuic, …) are recognised and skipped with a clear report.    #
+# --------------------------------------------------------------------------- #
+
+urldecode() { local s="${1//+/ }"; s="${s//%/\\x}"; printf '%b' "$s"; }
+
+b64d() {  # tolerant base64 decode (arg or stdin; url-safe alphabet + missing padding)
+  local s="${1:-}"; [ $# -eq 0 ] && s="$(cat)"
+  s="${s//$'\n'/}"; s="${s//$'\r'/}"; s="${s//-/+}"; s="${s//_/\/}"
+  local m=$(( ${#s} % 4 )); [ "$m" -ne 0 ] && s="$s$(printf '%*s' $((4-m)) '' | tr ' ' '=')"
+  printf '%s' "$s" | base64 -d 2>/dev/null
 }
-parse_subscription() {  # parse_subscription <url> -> TODO: echo a JSON array of nodes
-  return 3  # not implemented yet
+
+# emit_descriptor <type> <name> <server> <port> [k=v ...]  (empty values dropped; alpn is CSV)
+emit_descriptor() {
+  local type="$1" name="$2" server="$3" port="$4"; shift 4
+  local args=(--arg type "$type" --arg name "$name" --arg server "$server" --arg port "$port")
+  local prog='{type:$type,name:$name,server:$server,port:$port}'
+  local alpn_csv="" pair k v
+  for pair in "$@"; do
+    k="${pair%%=*}"; v="${pair#*=}"
+    [ "$k" = "alpn" ] && { alpn_csv="$v"; continue; }
+    [ -z "$v" ] && continue
+    args+=(--arg "$k" "$v"); prog="$prog + {$k:\$$k}"
+  done
+  args+=(--arg alpn "$alpn_csv")
+  prog="$prog + {alpn: (\$alpn | if .==\"\" then [] else split(\",\") end)}"
+  jq -nc "${args[@]}" "$prog"
+}
+
+parse_vless_uri() {
+  local uri="$1" rest name query userinfo hostport host port
+  rest="${uri#vless://}"
+  name=""; case "$rest" in *"#"*) name="$(urldecode "${rest##*#}")"; rest="${rest%%#*}";; esac
+  query=""; case "$rest" in *"?"*) query="${rest#*\?}"; rest="${rest%%\?*}";; esac
+  userinfo="${rest%@*}"; hostport="${rest##*@}"
+  host="${hostport%:*}"; port="${hostport##*:}"
+  local flow="" enc="none" sec="none" sni="" fp="" alpn="" pbk="" sid="" spx="" net="tcp" path="" hosth="" svc=""
+  local IFS='&' kv k v
+  for kv in $query; do
+    [ -z "$kv" ] && continue
+    k="${kv%%=*}"; v="$(urldecode "${kv#*=}")"
+    case "$k" in
+      encryption) enc="$v";; flow) flow="$v";; security) sec="$v";;
+      sni|peer) sni="$v";; fp) fp="$v";; alpn) alpn="$v";;
+      pbk) pbk="$v";; sid) sid="$v";; spx) spx="$v";;
+      type) net="$v";; path) path="$v";; host) hosth="$v";;
+      serviceName|servicename) svc="$v";;
+    esac
+  done
+  [ -z "$sni" ] && sni="$hosth"
+  emit_descriptor vless "$name" "$host" "$port" \
+    uuid="$userinfo" flow="$flow" encryption="$enc" security="$sec" \
+    sni="$sni" fp="$fp" alpn="$alpn" pbk="$pbk" sid="$sid" spx="$spx" \
+    network="$net" wsPath="$path" wsHost="$hosth" grpcService="$svc"
+}
+
+parse_trojan_uri() {
+  local uri="$1" rest name query userinfo hostport host port
+  rest="${uri#trojan://}"
+  name=""; case "$rest" in *"#"*) name="$(urldecode "${rest##*#}")"; rest="${rest%%#*}";; esac
+  query=""; case "$rest" in *"?"*) query="${rest#*\?}"; rest="${rest%%\?*}";; esac
+  userinfo="${rest%@*}"; hostport="${rest##*@}"
+  host="${hostport%:*}"; port="${hostport##*:}"
+  local sec="tls" sni="" fp="" alpn="" net="tcp" path="" hosth="" svc=""
+  local IFS='&' kv k v
+  for kv in $query; do
+    [ -z "$kv" ] && continue
+    k="${kv%%=*}"; v="$(urldecode "${kv#*=}")"
+    case "$k" in
+      security) sec="$v";; sni|peer) sni="$v";; fp) fp="$v";; alpn) alpn="$v";;
+      type) net="$v";; path) path="$v";; host) hosth="$v";; serviceName|servicename) svc="$v";;
+    esac
+  done
+  [ -z "$sni" ] && sni="$hosth"
+  emit_descriptor trojan "$name" "$host" "$port" \
+    password="$userinfo" security="$sec" sni="$sni" fp="$fp" alpn="$alpn" \
+    network="$net" wsPath="$path" wsHost="$hosth" grpcService="$svc"
+}
+
+parse_vmess_uri() {  # vmess://<base64 of a v2rayN JSON>
+  local j; j="$(b64d "${1#vmess://}")" || return 1
+  [ -n "$j" ] || return 1
+  jq -ce '{
+    type:"vmess", name:((.ps // "")|tostring), server:(.add|tostring), port:(.port|tostring),
+    uuid:(.id|tostring), alterId:((.aid // 0)|tostring), scy:((.scy // "auto")|tostring),
+    network:((.net // "tcp")|tostring),
+    security:(if ((.tls // "")|tostring)=="tls" then "tls" else "none" end),
+    sni:((.sni // .host // "")|tostring), fp:((.fp // "")|tostring),
+    wsPath:((.path // "/")|tostring), wsHost:((.host // "")|tostring),
+    grpcService:((.path // "")|tostring),
+    alpn:(((.alpn // "")|tostring)| if .=="" then [] else split(",") end)
+  }' <<<"$j" 2>/dev/null
+}
+
+parse_ss_uri() {
+  local rest="${1#ss://}" name="" method pass host port ui hp dec
+  case "$rest" in *"#"*) name="$(urldecode "${rest##*#}")"; rest="${rest%%#*}";; esac
+  case "$rest" in *"?"*) rest="${rest%%\?*}";; esac
+  if [[ "$rest" == *"@"* ]]; then
+    ui="${rest%@*}"; hp="${rest##*@}"
+    ui="$(b64d "$ui" 2>/dev/null || printf '%s' "$ui")"; [ -z "$ui" ] && ui="${rest%@*}"
+    method="${ui%%:*}"; pass="${ui#*:}"; host="${hp%:*}"; port="${hp##*:}"
+  else
+    dec="$(b64d "$rest")"; ui="${dec%@*}"; hp="${dec##*@}"
+    method="${ui%%:*}"; pass="${ui#*:}"; host="${hp%:*}"; port="${hp##*:}"
+  fi
+  emit_descriptor shadowsocks "$name" "$host" "$port" method="$method" password="$pass" network="tcp" security="none"
+}
+
+parse_unsupported_uri() {  # keep name/host so import can report what was skipped
+  local uri="$1" scheme="${1%%://*}" rest name hostport host="" port=""
+  rest="${uri#*://}"
+  name=""; case "$rest" in *"#"*) name="$(urldecode "${rest##*#}")"; rest="${rest%%#*}";; esac
+  case "$rest" in *"?"*) rest="${rest%%\?*}";; esac
+  hostport="${rest##*@}"; host="${hostport%:*}"; port="${hostport##*:}"
+  emit_descriptor "$scheme" "$name" "$host" "$port"
+}
+
+parse_share_link() {  # <uri> -> descriptor JSON; nonzero on unknown scheme
+  local uri="$1" scheme="${1%%://*}"
+  case "$scheme" in
+    vless)  parse_vless_uri "$uri" ;;
+    vmess)  parse_vmess_uri "$uri" ;;
+    trojan) parse_trojan_uri "$uri" ;;
+    ss)     parse_ss_uri "$uri" ;;
+    hysteria2|hy2|hysteria|tuic|juicity|wireguard|wg|ssr)
+            parse_unsupported_uri "$uri" ;;
+    *) return 3 ;;
+  esac
+}
+
+# Protocols with no Xray-core outbound — recognised, then skipped on import.
+XRAY_UNSUPPORTED='hysteria2 hy2 hysteria tuic juicity wireguard wg ssr snell'
+
+# Shared jq that turns descriptor fields into an Xray streamSettings object.
+read -r -d '' STREAM_JQ <<'JQ' || true
+def s: if . == null then "" else tostring end;
+def stream:
+  ({network: ((.network|s)|if .=="" then "tcp" else . end)})
+  + ( if (.security|s) == "reality" then
+        { security: "reality",
+          realitySettings: {
+            serverName: (.sni|s),
+            fingerprint: ((.fp|s)|if .=="" then "chrome" else . end),
+            publicKey: (.pbk|s),
+            shortId: (.sid|s),
+            spiderX: (.spx|s) } }
+      elif (.security|s) == "tls" or (.security|s) == "xtls" then
+        { security: "tls",
+          tlsSettings: ( { serverName: (.sni|s),
+                           fingerprint: ((.fp|s)|if .=="" then "chrome" else . end) }
+                         + ( if ((.alpn // [])|length) > 0 then {alpn: .alpn} else {} end ) ) }
+      else { security: "none" } end )
+  + ( if (.network|s) == "ws" then
+        { wsSettings: ( {path: ((.wsPath|s)|if .=="" then "/" else . end)}
+                        + ( if (.wsHost|s) != "" then {headers:{Host:(.wsHost|s)}} else {} end ) ) }
+      elif (.network|s) == "grpc" then
+        { grpcSettings: {serviceName: (.grpcService|s)} }
+      elif (.network|s) == "h2" or (.network|s) == "http" then
+        { httpSettings: ( {path: ((.wsPath|s)|if .=="" then "/" else . end)}
+                          + ( if (.wsHost|s) != "" then {host:[(.wsHost|s)]} else {} end ) ) }
+      else {} end );
+JQ
+
+build_outbound() {  # <descriptor> -> outbound JSON (tag proxy); return 3 if Xray can't run it
+  local d="$1" type; type="$(jq -r '.type' <<<"$d")"
+  case " $XRAY_UNSUPPORTED " in *" $type "*) return 3;; esac
+  case "$type" in
+    vless) jq -c "$STREAM_JQ"'
+      { tag:"proxy", protocol:"vless",
+        settings:{ vnext:[ { address:.server, port:(.port|tonumber),
+          users:[ ( {id:.uuid, encryption:((.encryption|s)|if .=="" then "none" else . end)}
+                    + ( if (.flow|s)!="" then {flow:.flow} else {} end) ) ] } ] },
+        streamSettings: stream }' <<<"$d" ;;
+    trojan) jq -c "$STREAM_JQ"'
+      { tag:"proxy", protocol:"trojan",
+        settings:{ servers:[ {address:.server, port:(.port|tonumber), password:.password} ] },
+        streamSettings: stream }' <<<"$d" ;;
+    vmess) jq -c "$STREAM_JQ"'
+      { tag:"proxy", protocol:"vmess",
+        settings:{ vnext:[ { address:.server, port:(.port|tonumber),
+          users:[ {id:.uuid, alterId:((.alterId|s)|if .=="" then 0 else tonumber end), security:((.scy|s)|if .=="" then "auto" else . end)} ] } ] },
+        streamSettings: stream }' <<<"$d" ;;
+    shadowsocks) jq -c '
+      { tag:"proxy", protocol:"shadowsocks",
+        settings:{ servers:[ {address:.server, port:(.port|tonumber), method:.method, password:.password} ] },
+        streamSettings:{network:((.network // "tcp")), security:"none"} }' <<<"$d" ;;
+    *) return 3 ;;
+  esac
+}
+
+# Flatten a Clash `proxies:` block into TAB-separated key/value records (\x1e between proxies).
+read -r -d '' CLASH_AWK <<'AWK' || true
+function ind(s,  n){ n=0; while(substr(s,n+1,1)==" ") n++; return n }
+function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
+function unq(s){ if(s ~ /^".*"$/ || s ~ /^'\''.*'\''$/) s=substr(s,2,length(s)-2); return s }
+BEGIN{ inp=0; base=-1; sp=0; started=0; lastkey="" }
+{
+  line=$0; sub(/\r$/,"",line)
+  if(line ~ /^[^ #-]/){
+    if(line ~ /^proxies[ \t]*:/){ inp=1; next }
+    else if(inp){ inp=0 }
+  }
+  if(!inp) next
+  if(line ~ /^[ ]*$/ || line ~ /^[ ]*#/) next
+  i=ind(line); c=substr(line,i+1)
+  isdash = (c ~ /^- / || c=="-")
+  if(isdash && (base==-1 || i==base)){
+    if(started) printf "\x1e"
+    started=1; base=i; sp=0; lastkey=""
+    kv(substr(c,3), i+2)
+    next
+  }
+  if(isdash && i>base){
+    v=unq(trim(substr(c,3)))
+    if(lastkey!="") printf "%s\t%s\n", lastkey, v
+    next
+  }
+  kv(c, i)
+}
+function kv(s, indent,  pos,k,v,fk,prefix){
+  pos=index(s,":"); if(pos==0) return
+  k=trim(substr(s,1,pos-1)); v=trim(substr(s,pos+1))
+  while(sp>0 && stkind[sp]>=indent) sp--
+  prefix=(sp>0 ? stkpfx[sp] : "")
+  fk=prefix k
+  if(v==""){ sp++; stkind[sp]=indent; stkpfx[sp]=fk"."; lastkey=fk }
+  else { printf "%s\t%s\n", fk, unq(v) }
+}
+AWK
+
+clash_to_descriptors() {  # YAML on stdin -> one descriptor JSON per line
+  local rec
+  awk "$CLASH_AWK" | while IFS= read -r -d $'\x1e' rec || [ -n "$rec" ]; do
+    [ -n "$(printf '%s' "$rec" | tr -d '[:space:]')" ] || continue
+    declare -A A=(); local alpn_csv="" k v
+    while IFS=$'\t' read -r k v; do
+      [ -z "$k" ] && continue
+      if [ "$k" = "alpn" ]; then [ -n "$alpn_csv" ] && alpn_csv="$alpn_csv,$v" || alpn_csv="$v"; continue; fi
+      A["$k"]="$v"
+    done <<< "$rec"
+    local type="${A[type]:-}"; [ -n "$type" ] || { unset A; continue; }
+    [ "$type" = "ss" ] && type="shadowsocks"
+    local net="${A[network]:-tcp}" tls="${A[tls]:-}" sec="none"
+    local pbk="${A[reality-opts.public-key]:-}" sid="${A[reality-opts.short-id]:-}"
+    if [ -n "$pbk" ]; then sec="reality"; elif [ "$tls" = "true" ]; then sec="tls"; fi
+    local sni="${A[servername]:-${A[sni]:-}}"
+    emit_descriptor "$type" "${A[name]:-}" "${A[server]:-}" "${A[port]:-}" \
+      uuid="${A[uuid]:-}" password="${A[password]:-}" flow="${A[flow]:-}" \
+      network="$net" security="$sec" sni="$sni" fp="${A[client-fingerprint]:-}" \
+      pbk="$pbk" sid="$sid" spx="${A[reality-opts.spider-x]:-}" alpn="$alpn_csv" \
+      wsPath="${A[ws-opts.path]:-}" wsHost="${A[ws-opts.headers.Host]:-}" \
+      grpcService="${A[grpc-opts.grpc-service-name]:-}" \
+      alterId="${A[alterId]:-}" scy="${A[cipher]:-}" method="${A[cipher]:-}"
+    unset A
+  done
+}
+
+sublist_to_descriptors() {  # decoded/raw link list on stdin -> descriptors
+  local line d
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | tr -d '\r')"
+    line="${line#"${line%%[![:space:]]*}"}"
+    [ -z "$line" ] && continue
+    case "$line" in *"://"*) ;; *) continue;; esac
+    if d="$(parse_share_link "$line")" && [ -n "$d" ]; then printf '%s\n' "$d"; fi
+  done
+}
+
+fetch_url() {  # <url|path> -> stdout
+  local u="$1"
+  case "$u" in
+    http://*|https://*|file://*)
+      if have curl; then curl -fsSL --max-time 30 "$u"
+      else wget -qO- "$u"; fi ;;
+    *) [ -f "$u" ] && cat "$u" || return 1 ;;
+  esac
+}
+
+detect_format() {  # <file> -> clash | base64 | raw | unknown
+  local f="$1" dec
+  if grep -qiE '^[[:space:]]*proxies[[:space:]]*:' "$f" || grep -qi 'proxy-groups' "$f"; then
+    echo clash; return
+  fi
+  dec="$(tr -d '[:space:]' < "$f" | b64d)"
+  if printf '%s' "$dec" | grep -q '://'; then echo base64; return; fi
+  if grep -q '://' "$f"; then echo raw; return; fi
+  echo unknown
+}
+
+unique_name() {  # <base> <nodes-json> -> a name not present in nodes
+  local base="$1" arr="$2" n="$1" i=1
+  while jq -e --arg n "$n" 'any(.[]?; .name==$n)' <<<"$arr" >/dev/null 2>&1; do
+    i=$((i+1)); n="$base #$i"
+  done
+  printf '%s' "$n"
+}
+
+reselect_active() {  # keep the active node if it still exists, else pick the first
+  ensure_nodes
+  local count cur first
+  count="$(jq 'length' "$NODES_FILE")"
+  if [ "$count" -eq 0 ]; then cmd_direct >/dev/null; warn "no usable nodes — switched to direct"; return; fi
+  cur="$(current_name)"
+  if [ -n "$cur" ] && jq -e --arg n "$cur" 'any(.[]; .name==$n)' "$NODES_FILE" >/dev/null 2>&1; then
+    cmd_use "$cur" >/dev/null; ok "active node kept: $cur"
+  else
+    first="$(jq -r '.[0].name' "$NODES_FILE")"
+    cmd_use "$first" >/dev/null; ok "active node set to: $first"
+  fi
+}
+
+do_import() {  # <url|file> <replace|append>
+  need_jq
+  local src="$1" mode="${2:-replace}" tmp fmt descs
+  tmp="$(mktemp)"
+  fetch_url "$src" > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "failed to fetch: $src"; }
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "empty response from: $src"; }
+  fmt="$(detect_format "$tmp")"
+  [ "$fmt" = unknown ] && { rm -f "$tmp"; die "unrecognised subscription format (expected Clash YAML or base64/raw links)"; }
+  info "detected subscription format: $fmt"
+  case "$fmt" in
+    clash)  descs="$(clash_to_descriptors < "$tmp")" ;;
+    base64) descs="$(tr -d '[:space:]' < "$tmp" | b64d | sublist_to_descriptors)" ;;
+    raw)    descs="$(sublist_to_descriptors < "$tmp")" ;;
+  esac
+  rm -f "$tmp"
+  [ -n "$descs" ] || die "no nodes found in the subscription"
+
+  ensure_nodes
+  local nodes='[]'; [ "$mode" = append ] && nodes="$(cat "$NODES_FILE")"
+  local added=0 skipped=0 skips="" d nm typ ob
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    nm="$(jq -r '.name // "node"' <<<"$d")"; typ="$(jq -r '.type' <<<"$d")"
+    [ -n "$nm" ] || nm="$typ"
+    if ob="$(build_outbound "$d" 2>/dev/null)" && [ -n "$ob" ]; then
+      nm="$(unique_name "$nm" "$nodes")"
+      nodes="$(jq -c --arg n "$nm" --argjson ob "$ob" '. + [{name:$n, outbound:$ob}]' <<<"$nodes")"
+      added=$((added+1))
+    else
+      skipped=$((skipped+1)); skips="$skips
+    - $nm ($typ)"
+    fi
+  done <<< "$descs"
+
+  printf '%s\n' "$nodes" > "$NODES_FILE"
+  ok "imported $added node(s) [$fmt, mode=$mode]"
+  if [ "$skipped" -gt 0 ]; then
+    warn "skipped $skipped node(s) Xray-core cannot run (hysteria2/tuic/…):$skips"
+  fi
+  reselect_active
+  cmd_list
 }
 
 cmd_add() {
   local link="${1:-}"
-  [ -n "$link" ] || die "usage: xraycli add '<share-link>'   (e.g. vmess://…, vless://…, trojan://…, ss://…)"
-  local scheme="${link%%://*}"
-  warn "share-link import is not wired up yet."
-  cat >&2 <<EOF
-      detected scheme : ${scheme}
-      planned support : vmess://  vless://  trojan://  ss://  (+ others on request)
-      to finish this  : implement parse_share_link() in $BIN_SELF
-                        (it should print a node object and be appended to nodes.json)
-EOF
-  return 2
+  [ -n "$link" ] || die "usage: xraycli add '<share-link>'   (vless:// vmess:// trojan:// ss://)"
+  need_jq
+  local d typ nm ob
+  d="$(parse_share_link "$link")" || die "unrecognised link scheme: ${link%%://*}"
+  [ -n "$d" ] || die "could not parse the link"
+  typ="$(jq -r '.type' <<<"$d")"; nm="$(jq -r '.name // "node"' <<<"$d")"; [ -n "$nm" ] || nm="$typ"
+  ob="$(build_outbound "$d" 2>/dev/null)" || die "Xray-core has no outbound for '$typ' — cannot add this node"
+  ensure_nodes
+  local nodes; nodes="$(jq -c --arg n "$nm" 'map(select(.name != $n))' "$NODES_FILE")"
+  nm="$(unique_name "$nm" "$nodes")"
+  jq -c --arg n "$nm" --argjson ob "$ob" '. + [{name:$n, outbound:$ob}]' <<<"$nodes" > "$NODES_FILE"
+  ok "added node: $nm ($typ)"
+  echo "  activate it with:  xraycli use '$nm'"
+}
+
+cmd_import() {  # xraycli import <url|file>  (one-off, replaces node list)
+  local src="${1:?usage: xraycli import <url|file>}"
+  do_import "$src" replace
 }
 
 cmd_sub() {
@@ -435,16 +788,8 @@ cmd_sub() {
 cmd_update() {
   [ -f "$SUB_FILE" ] || die "no subscription set — run: xraycli sub set '<url>'"
   local url; url="$(cat "$SUB_FILE")"
-  warn "subscription fetch/parse is not wired up yet."
-  cat >&2 <<EOF
-      subscription URL : $url
-      to finish this   : implement parse_subscription() in $BIN_SELF
-                         (fetch the URL, decode/parse nodes, write nodes.json,
-                          then: xraycli use <n> && xraycli restart)
-      tell me the subscription type (base64 link-list / Clash YAML / SIP008 / …)
-      and node protocols you use, and this will be implemented.
-EOF
-  return 2
+  info "updating from subscription: $url"
+  do_import "$url" replace
 }
 
 # --------------------------------------------------------------------------- #
@@ -548,11 +893,12 @@ ${c_bld}Lifecycle${c_rst}
   log [service|error|access]   follow logs
   test                  verify the proxy reaches the internet (prints egress IP)
 
-${c_bld}Nodes / subscription${c_rst}
-  add '<share-link>'    add a node from a share link          ${c_dim}(import: not wired yet)${c_rst}
+${c_bld}Nodes / subscription${c_rst}  ${c_dim}(auto-detects base64 & Clash; skips protocols Xray can't run)${c_rst}
+  add '<share-link>'    add one node (vless:// vmess:// trojan:// ss://)
   sub set '<url>'       save a subscription URL
   sub show|clear        show / clear the subscription URL
-  update                fetch + parse the subscription         ${c_dim}(import: not wired yet)${c_rst}
+  update                fetch the saved subscription and rebuild the node list
+  import <url|file>     one-off import from a URL or local file
   list                  list saved nodes ('*' = active)
   use <index|name>      select the active node
   remove <index|name>   delete a node
@@ -589,6 +935,7 @@ main() {
     add)              cmd_add "$@" ;;
     sub|subscribe)    cmd_sub "$@" ;;
     update)           cmd_update "$@" ;;
+    import)           cmd_import "$@" ;;
     list|ls)          cmd_list "$@" ;;
     use|select)       cmd_use "$@" ;;
     remove|rm|del)    cmd_remove "$@" ;;
