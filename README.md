@@ -1,5 +1,7 @@
 # xraycli
 
+**English** | [简体中文](./README_zh.md)
+
 A tiny, **user-scope** command-line manager for an [Xray-core](https://github.com/XTLS/Xray-core)
 local proxy. One installer, one control script, one *user* systemd service —
 everything lives under your `$HOME`. No `sudo`, no system files touched, and a
