@@ -199,6 +199,35 @@ proxyoff                       # 取消
 
 或者让应用直接连 `xraycli port` 显示的端口（SOCKS5 `127.0.0.1:<socks>`，HTTP `127.0.0.1:<http>`）。
 
+### 让 Claude Code / Codex 走代理
+
+这两个工具都认标准的 `HTTP_PROXY` / `HTTPS_PROXY` 变量 —— 把它们指向 xraycli 的 **HTTP** 入站
+（端口用 `xraycli port` 查看；下面的 `10809` 只是默认值，请换成你自己的）。配置前先确认代理已在运行：
+`xraycli status` / `xraycli test`。
+
+**Claude Code** —— `~/.claude/settings.json` 里的 `env` 会应用到每次会话：
+
+```json
+{
+  "env": {
+    "HTTP_PROXY": "http://127.0.0.1:10809",
+    "HTTPS_PROXY": "http://127.0.0.1:10809"
+  }
+}
+```
+
+如果该文件已存在，只需把 `env` 这一段合并进去（保持 JSON 合法）。
+
+**Codex** —— `~/.codex/.env`，每行一个 `KEY=value`：
+
+```dotenv
+HTTP_PROXY=http://127.0.0.1:10809
+HTTPS_PROXY=http://127.0.0.1:10809
+```
+
+> 用 `xraycli port` 查看实际端口。若想用 SOCKS5 而非 HTTP 入站，把值改成
+> `socks5://127.0.0.1:<socks>` 即可。
+
 ---
 
 ## 命令速查

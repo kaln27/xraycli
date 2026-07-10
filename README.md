@@ -123,6 +123,35 @@ proxyoff     # unset them again
 Or configure an app directly with the ports shown by `xraycli port`
 (SOCKS5 at `127.0.0.1:<socks>`, HTTP at `127.0.0.1:<http>`).
 
+### Route Claude Code / Codex through the proxy
+
+Both tools honour the standard `HTTP_PROXY` / `HTTPS_PROXY` variables — point them
+at xraycli's **HTTP** inbound (the port from `xraycli port`; `10809` below is just
+the default — use yours). Make sure the proxy is up first: `xraycli status` / `xraycli test`.
+
+**Claude Code** — `~/.claude/settings.json` applies its `env` block to every session:
+
+```json
+{
+  "env": {
+    "HTTP_PROXY": "http://127.0.0.1:10809",
+    "HTTPS_PROXY": "http://127.0.0.1:10809"
+  }
+}
+```
+
+If the file already exists, merge just the `env` block into it (keep it valid JSON).
+
+**Codex** — `~/.codex/.env`, one `KEY=value` per line:
+
+```dotenv
+HTTP_PROXY=http://127.0.0.1:10809
+HTTPS_PROXY=http://127.0.0.1:10809
+```
+
+> Find the exact port with `xraycli port`. To use SOCKS5 instead of the HTTP
+> inbound, set the value to `socks5://127.0.0.1:<socks>`.
+
 ---
 
 ## On-disk layout
