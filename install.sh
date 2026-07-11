@@ -474,11 +474,9 @@ run_wizard() {
   if ask "1) Import a subscription now?" y; then
     read -rp "   Paste the subscription URL (blank = skip): " url || true
     if [ -n "${url:-}" ]; then
-      if "$xr" sub set "$url" && "$xr" update; then
-        "$xr" list || true
-      else
-        warn "import failed — retry later with:  xraycli sub set '<url>' && xraycli update"
-      fi
+      # 'update' already prints the resulting node list — don't list again.
+      "$xr" sub set "$url" && "$xr" update \
+        || warn "import failed — retry later with:  xraycli sub set '<url>' && xraycli update"
     fi
   fi
 

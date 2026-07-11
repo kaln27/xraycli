@@ -498,18 +498,49 @@ cmd_list() {
   need_jq; ensure_nodes
   local n; n="$(jq 'length' "$NODES_FILE")"
   if [ "$n" -eq 0 ]; then
-    echo "no nodes yet."
-    echo "  add one   : xraycli add '<share-link>'"
-    echo "  or import : xraycli sub set '<url>' && xraycli update"
+    printf '  no nodes yet.\n'
+    printf '    add one   : %sxraycli add '\''<share-link>'\''%s\n' "$c_dim" "$c_rst"
+    printf '    or import : %sxraycli sub set '\''<url>'\'' && xraycli update%s\n' "$c_dim" "$c_rst"
     return 0
   fi
   local cur; cur="$(current_name)"
-  jq -r --arg cur "$cur" '
-    to_entries[] |
-    "  [\(.key)] \(if .value.name==$cur then "* " else "  " end)\(.value.name)  (\(.value.outbound.protocol // "?"))"
-  ' "$NODES_FILE"
-  echo
-  echo "  * = active   |   switch with: xraycli use <index|name>"
+
+  # One TSV row per node: idx, active(1/0), name, proto, server:port, net/sec.
+  local rows
+  rows="$(jq -r --arg cur "$cur" '
+    def ep:
+      (.outbound.settings.vnext[0] // .outbound.settings.servers[0]) as $e
+      | if $e then "\($e.address):\($e.port)" else "-" end;
+    def ns:
+      "\(.outbound.streamSettings.network // "tcp")/\(.outbound.streamSettings.security // "none")";
+    def proto:
+      (.outbound.protocol // "?") | if . == "shadowsocks" then "ss" else . end;
+    to_entries[]
+    | [ (.key|tostring),
+        (if .value.name == $cur then "1" else "0" end),
+        .value.name,
+        (.value|proto),
+        (.value|ep),
+        (.value|ns) ] | @tsv
+  ' "$NODES_FILE")"
+
+  # size each column to its widest cell (header labels set the minimums)
+  local wN=4 wP=5 wS=6 idx act name proto ep ns
+  while IFS=$'\t' read -r idx act name proto ep ns; do
+    [ "${#name}"  -gt "$wN" ] && wN="${#name}"
+    [ "${#proto}" -gt "$wP" ] && wP="${#proto}"
+    [ "${#ep}"    -gt "$wS" ] && wS="${#ep}"
+  done <<< "$rows"
+
+  printf '%s  %s %-2s %-*s  %-*s  %-*s  %s%s\n' \
+    "$c_dim" " " "#" "$wN" "NAME" "$wP" "PROTO" "$wS" "SERVER" "NET/SEC" "$c_rst"
+  local mark col
+  while IFS=$'\t' read -r idx act name proto ep ns; do
+    if [ "$act" = 1 ]; then mark="${c_grn}●${c_rst}"; col="$c_grn"; else mark=' '; col=""; fi
+    printf '  %s %-2s %s%-*s%s  %-*s  %-*s  %s%s%s\n' \
+      "$mark" "$idx" "$col" "$wN" "$name" "$c_rst" "$wP" "$proto" "$wS" "$ep" "$c_dim" "$ns" "$c_rst"
+  done <<< "$rows"
+  printf '%s  ● active  ·  switch: xraycli use <#|name>%s\n' "$c_dim" "$c_rst"
 }
 
 cmd_current() {
