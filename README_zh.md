@@ -20,7 +20,10 @@ xraycli     →  启动 / 停止 / 重启 / 状态 / 开机自启 / 日志 / 节
   `~/.local/state`，命令 `xraycli` 在 `~/.local/bin`。不写入 `/etc`、`/usr` 或任何系统服务。
 - **自动识别架构**：`install.sh` 通过 `uname` 自动拉取匹配的版本
   （`x86_64`、`arm64`、`armv7`、`i386`、`s390x` …；支持 Linux 与 macOS）。
-- **自动挑选空闲端口**：为 SOCKS 与 HTTP 入站各选一个未被占用的本地端口，绝不与已有服务冲突。
+- **端口与用户名绑定**：SOCKS/HTTP 端口由 `$USER` 确定性地推导而来（用 `cksum` 哈希映射到
+  `20000–27999` 区间），同一用户在任何机器、任何次重装都拿到同一对端口，不同用户则自然错开；
+  被占用时自动 `+1` 探测。可用 `--socks-port` / `--http-port` 覆盖，或用 `--no-user-port`
+  退回普通的空闲端口扫描。
 - **两种服务方式**：优先用 systemd 用户服务（带崩溃自动重启）；当 systemd 不可用、或其单元目录
   不在你的 `$HOME` 下时，自动改用 xraycli 内置的守护进程（同样自动重启），一切仍留在 `$HOME` 内。
 - **Shell 集成**：向 `~/.bashrc` 追加一小段带标记的内容，把 `~/.local/bin` 加入 `PATH`，
@@ -62,8 +65,9 @@ source ~/.bashrc
 | 参数 | 含义 |
 | --- | --- |
 | `--version vX.Y.Z` | 指定 Xray-core 版本（默认：最新） |
-| `--socks-port N` | 首选 SOCKS 端口（默认：从 `10808` 起自动选空闲） |
-| `--http-port N` | 首选 HTTP 端口（默认：从 `10809` 起自动选空闲） |
+| `--socks-port N` | 首选 SOCKS 端口（默认：由 `$USER` 推导） |
+| `--http-port N` | 首选 HTTP 端口（默认：SOCKS 基准端口 + 1） |
+| `--no-user-port` | 不按 `$USER` 推导端口；从 `10808`/`10809` 起扫描 |
 | `--listen ADDR` | 本地监听地址（默认：`127.0.0.1`） |
 | `--no-service` | 不安装/启用系统服务 |
 | `--no-bashrc` | 不修改 `~/.bashrc` |

@@ -22,8 +22,12 @@ xraycli     →  start / stop / restart / status / enable / logs / nodes / unins
   in `~/.local/bin`. Nothing goes to `/etc`, `/usr`, or any system unit.
 - **Auto architecture detection.** `install.sh` reads `uname` and pulls the
   matching release (`x86_64`, `arm64`, `armv7`, `i386`, `s390x`, …; Linux & macOS).
-- **Auto free-port selection.** Two unused local ports are chosen for the SOCKS
-  and HTTP inbounds so it never clashes with anything already listening.
+- **Username-derived ports.** The SOCKS/HTTP ports are a deterministic function
+  of `$USER` (a `cksum` hash into the `20000–27999` window), so the same user
+  always gets the same pair across reinstalls and machines — and different users
+  land on different ports. A busy port just bumps `+1`. Override with
+  `--socks-port` / `--http-port`, or fall back to a plain free-port scan with
+  `--no-user-port`.
 - **systemd user service** with auto-restart, plus a manual fallback when no
   user session bus is available.
 - **Shell integration.** A small, clearly-marked block is appended to
@@ -70,8 +74,9 @@ source ~/.bashrc
 | Option | Meaning |
 | --- | --- |
 | `--version vX.Y.Z` | Pin a specific Xray-core version (default: latest) |
-| `--socks-port N` | Preferred SOCKS port (default: auto from `10808`) |
-| `--http-port N` | Preferred HTTP port (default: auto from `10809`) |
+| `--socks-port N` | Preferred SOCKS port (default: derived from `$USER`) |
+| `--http-port N` | Preferred HTTP port (default: SOCKS base + 1) |
+| `--no-user-port` | Don't derive ports from `$USER`; scan from `10808`/`10809` |
 | `--listen ADDR` | Local listen address (default: `127.0.0.1`) |
 | `--no-service` | Skip installing/enabling the systemd user service |
 | `--no-bashrc` | Do not modify `~/.bashrc` |

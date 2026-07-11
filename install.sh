@@ -8,7 +8,7 @@
 #   * detects OS + CPU architecture and downloads the matching Xray-core release
 #   * installs the core + geodata under  ~/.local/share/xraycli/core
 #   * places the `xraycli` control script in  ~/.local/bin
-#   * picks two free local ports (SOCKS + HTTP) for the proxy inbounds
+#   * picks two local ports (SOCKS + HTTP) derived from $USER, +1 if busy
 #   * generates an initial Xray config (pass-through until a node is added)
 #   * installs a *user* systemd unit  ~/.config/systemd/user/xraycli.service
 #   * appends a small, clearly-marked block to ~/.bashrc (PATH + proxyon/off)
@@ -21,8 +21,9 @@
 #
 # Options:
 #   --version <vX.Y.Z>   Install a specific Xray-core version (default: latest)
-#   --socks-port <n>     Preferred SOCKS port   (default: auto, from 10808)
-#   --http-port  <n>     Preferred HTTP  port   (default: auto, from 10809)
+#   --socks-port <n>     Preferred SOCKS port   (default: derived from $USER)
+#   --http-port  <n>     Preferred HTTP  port   (default: SOCKS base + 1)
+#   --no-user-port       Do not derive ports from $USER; scan from 10808/10809
 #   --listen <addr>      Local listen address   (default: 127.0.0.1)
 #   --no-service         Do not install/enable the systemd user service
 #   --no-bashrc          Do not modify ~/.bashrc
@@ -65,13 +66,20 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 #  Defaults / CLI options                                                     #
 # --------------------------------------------------------------------------- #
 XRAY_VERSION="latest"
-PREF_SOCKS_PORT=10808
-PREF_HTTP_PORT=10809
+PREF_SOCKS_PORT=""          # empty → derive from $USER (see user_port_base)
+PREF_HTTP_PORT=""           # empty → derive from $USER (SOCKS base + 1)
+USER_PORT=1                 # 1 → ports are a deterministic function of $USER
 LISTEN_ADDR="127.0.0.1"
 DO_SERVICE=1
 DO_BASHRC=1
 DO_DEPS=1
 MIRROR=""
+
+# Username-derived port window. Same $USER always maps to the same SOCKS base,
+# so ports are stable across reinstalls/machines. 20000–27998 (even) avoids the
+# privileged (<1024) and Linux ephemeral (32768+) ranges. HTTP = base + 1.
+PORT_WINDOW_START=20000
+PORT_WINDOW_SLOTS=4000
 
 # --------------------------------------------------------------------------- #
 #  Pretty output                                                              #
@@ -101,8 +109,9 @@ Usage:
 
 Options:
   --version <vX.Y.Z>   Install a specific Xray-core version (default: latest)
-  --socks-port <n>     Preferred SOCKS port   (default: auto, from 10808)
-  --http-port  <n>     Preferred HTTP  port   (default: auto, from 10809)
+  --socks-port <n>     Preferred SOCKS port   (default: derived from $USER)
+  --http-port  <n>     Preferred HTTP  port   (default: SOCKS base + 1)
+  --no-user-port       Do not derive ports from $USER; scan from 10808/10809
   --listen <addr>      Local listen address   (default: 127.0.0.1)
   --no-service         Do not install/enable the systemd user service
   --no-bashrc          Do not modify ~/.bashrc
@@ -121,6 +130,7 @@ while [ $# -gt 0 ]; do
     --version)    XRAY_VERSION="${2:?}"; shift 2 ;;
     --socks-port) PREF_SOCKS_PORT="${2:?}"; shift 2 ;;
     --http-port)  PREF_HTTP_PORT="${2:?}"; shift 2 ;;
+    --no-user-port) USER_PORT=0; shift ;;
     --listen)     LISTEN_ADDR="${2:?}"; shift 2 ;;
     --mirror)     MIRROR="${2:?}"; shift 2 ;;
     --no-service) DO_SERVICE=0; shift ;;
@@ -288,10 +298,35 @@ install_core() {
   ok "installed core: ${ver:-unknown}"
 }
 
+port_user() {  # the identity we hash: $USER, with sane fallbacks
+  local u="${USER:-}"
+  [ -n "$u" ] || u="$(id -un 2>/dev/null || whoami 2>/dev/null || printf 'user')"
+  printf '%s' "$u"
+}
+
+user_port_base() {  # deterministic SOCKS base port for the current user
+  local u h
+  u="$(port_user)"
+  # cksum: POSIX, no extra dependency, stable CRC of the name -> a 32-bit number.
+  h="$(printf '%s' "$u" | cksum | awk '{print $1}')"
+  printf '%s\n' "$(( PORT_WINDOW_START + (h % PORT_WINDOW_SLOTS) * 2 ))"
+}
+
 choose_ports() {
-  info "Selecting free local proxy ports"
-  SOCKS_PORT="$(find_free_port "$PREF_SOCKS_PORT")"
-  HTTP_PORT="$(find_free_port "$PREF_HTTP_PORT" "$SOCKS_PORT")"
+  local socks_start http_start base
+  if [ "$USER_PORT" -eq 1 ]; then
+    base="$(user_port_base)"
+    socks_start="${PREF_SOCKS_PORT:-$base}"
+    http_start="${PREF_HTTP_PORT:-$(( base + 1 ))}"
+    info "Selecting proxy ports (base $base derived from user '$(port_user)')"
+  else
+    socks_start="${PREF_SOCKS_PORT:-10808}"
+    http_start="${PREF_HTTP_PORT:-10809}"
+    info "Selecting free local proxy ports"
+  fi
+  # Derived value is the starting point; a busy port just bumps +1 (find_free_port).
+  SOCKS_PORT="$(find_free_port "$socks_start")"
+  HTTP_PORT="$(find_free_port "$http_start" "$SOCKS_PORT")"
   ok "SOCKS -> $LISTEN_ADDR:$SOCKS_PORT   HTTP -> $LISTEN_ADDR:$HTTP_PORT"
 }
 
