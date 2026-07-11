@@ -31,8 +31,7 @@ xraycli     →  start / stop / restart / status / enable / logs / nodes / unins
 - **systemd user service** with auto-restart, plus a manual fallback when no
   user session bus is available.
 - **Shell integration.** A small, clearly-marked block is appended to
-  `~/.bashrc` that puts `~/.local/bin` on `PATH` and adds `proxyon` / `proxyoff`
-  helpers to toggle this shell's proxy env vars.
+  `~/.bashrc` that puts `~/.local/bin` on `PATH` (so `xraycli` is on your path).
 - **Clean uninstall.** `xraycli uninstall` removes the service, all data dirs,
   the `~/.bashrc` block, and the command itself.
 
@@ -56,9 +55,9 @@ straight through, e.g. `… /install.sh) --no-service`.
 > stdin, so confirmation prompts still work.
 
 When run interactively, the installer finishes with a short **setup wizard** that
-offers to (1) import a subscription, (2) start the proxy and enable boot
-auto-start, and (3) route Claude Code / Codex through it. Every step is optional
-and repeatable later; skip the whole thing with `--no-wizard`.
+offers to (1) import a subscription and (2) start the proxy and enable boot
+auto-start. Both steps are optional and repeatable later; skip the wizard with
+`--no-wizard`.
 
 ### From a checkout
 
@@ -127,16 +126,19 @@ Maintenance
 
 ### Point programs at the proxy
 
-After `source ~/.bashrc`:
+`xraycli port` prints the local ports — HTTP at `127.0.0.1:<http>`, SOCKS5 at
+`127.0.0.1:<socks>`. Point any app at those, e.g.:
 
 ```bash
-proxyon      # exports http_proxy/https_proxy/all_proxy for THIS shell
-curl https://api.ip.sb/ip
-proxyoff     # unset them again
+curl -x "http://127.0.0.1:$(xraycli port | awk '/http/{print $2}' | cut -d: -f2)" https://api.ip.sb/ip
 ```
 
-Or configure an app directly with the ports shown by `xraycli port`
-(SOCKS5 at `127.0.0.1:<socks>`, HTTP at `127.0.0.1:<http>`).
+or export the proxy vars for your shell yourself:
+
+```bash
+export http_proxy=http://127.0.0.1:<http> https_proxy=http://127.0.0.1:<http>
+export all_proxy=socks5://127.0.0.1:<socks>
+```
 
 ### Route Claude Code / Codex through the proxy
 

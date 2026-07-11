@@ -26,8 +26,7 @@ xraycli     →  启动 / 停止 / 重启 / 状态 / 开机自启 / 日志 / 节
   退回普通的空闲端口扫描。
 - **两种服务方式**：优先用 systemd 用户服务（带崩溃自动重启）；当 systemd 不可用、或其单元目录
   不在你的 `$HOME` 下时，自动改用 xraycli 内置的守护进程（同样自动重启），一切仍留在 `$HOME` 内。
-- **Shell 集成**：向 `~/.bashrc` 追加一小段带标记的内容，把 `~/.local/bin` 加入 `PATH`，
-  并提供 `proxyon` / `proxyoff` 两个函数用于快速给当前 shell 开关代理环境变量。
+- **Shell 集成**：向 `~/.bashrc` 追加一小段带标记的内容，把 `~/.local/bin` 加入 `PATH`（让 `xraycli` 可直接调用）。
 - **干净卸载**：`xraycli uninstall` 会移除服务、所有数据目录、`~/.bashrc` 里的片段以及命令本身。
 
 ---
@@ -47,8 +46,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh
 > 建议用 `bash <(curl …)` 而不是 `curl … | bash`：前者会保留终端 stdin，交互确认才能正常工作。
 
 在交互式运行时，安装脚本最后会进入一个简短的**设置向导**，依次引导你：(1) 导入订阅，
-(2) 启动代理并设为开机自启，(3) 把 Claude Code / Codex 接到代理上。每一步都是可选的、
-以后也能单独再来一遍；想整体跳过就加 `--no-wizard`。
+(2) 启动代理并设为开机自启。每一步都是可选的、以后也能单独再来一遍；想跳过向导就加 `--no-wizard`。
 
 ### 从源码安装
 
@@ -198,15 +196,14 @@ xraycli port        # 打印本地代理端口
 
 ### 4. 让程序走代理
 
-`source ~/.bashrc` 之后，用两个辅助函数给**当前 shell** 开/关代理环境变量：
+`xraycli port` 会打印本地端口（HTTP `127.0.0.1:<http>`、SOCKS5 `127.0.0.1:<socks>`）。
+把应用指过去即可，或者自己在 shell 里导出代理环境变量：
 
 ```bash
-proxyon                        # 设置 http_proxy/https_proxy/all_proxy
+export http_proxy=http://127.0.0.1:<http> https_proxy=http://127.0.0.1:<http>
+export all_proxy=socks5://127.0.0.1:<socks>
 curl https://api.ip.sb/ip      # 走代理
-proxyoff                       # 取消
 ```
-
-或者让应用直接连 `xraycli port` 显示的端口（SOCKS5 `127.0.0.1:<socks>`，HTTP `127.0.0.1:<http>`）。
 
 ### 让 Claude Code / Codex 走代理
 

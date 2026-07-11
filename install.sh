@@ -11,7 +11,7 @@
 #   * picks two local ports (SOCKS + HTTP) derived from $USER, +1 if busy
 #   * generates an initial Xray config (pass-through until a node is added)
 #   * installs a *user* systemd unit  ~/.config/systemd/user/xraycli.service
-#   * appends a small, clearly-marked block to ~/.bashrc (PATH + proxyon/off)
+#   * appends a small, clearly-marked block to ~/.bashrc (adds ~/.local/bin to PATH)
 #
 # Re-running is safe (idempotent upgrade). Remove everything with:
 #   xraycli uninstall        (or ./uninstall.sh)
@@ -401,24 +401,9 @@ patch_bashrc() {
 $begin
 # Managed by xraycli — remove with 'xraycli uninstall'. Do not edit by hand.
 case ":\$PATH:" in *":\$HOME/.local/bin:"*) ;; *) export PATH="\$HOME/.local/bin:\$PATH";; esac
-# proxyon / proxyoff: toggle this shell's proxy env vars to the xraycli inbounds.
-proxyon() {
-  local ef="\$HOME/.config/$APP/xraycli.env"
-  [ -f "\$ef" ] && . "\$ef"
-  local h="\${XRAYCLI_LISTEN:-127.0.0.1}" hp="\${XRAYCLI_HTTP_PORT:-10809}" sp="\${XRAYCLI_SOCKS_PORT:-10808}"
-  export http_proxy="http://\$h:\$hp" https_proxy="http://\$h:\$hp"
-  export HTTP_PROXY="\$http_proxy" HTTPS_PROXY="\$https_proxy"
-  export all_proxy="socks5://\$h:\$sp" ALL_PROXY="\$all_proxy"
-  export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="\$no_proxy"
-  echo "proxy ON  -> http://\$h:\$hp  (socks5://\$h:\$sp)"
-}
-proxyoff() {
-  unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
-  echo "proxy OFF"
-}
 $end
 EOF
-  ok "added xraycli block to ~/.bashrc (PATH + proxyon/proxyoff)"
+  ok "added xraycli block to ~/.bashrc (PATH only)"
 }
 
 summary() {
@@ -435,14 +420,14 @@ summary() {
   echo "  HTTP  proxy    : $LISTEN_ADDR:$http"
   echo
   echo "Next steps:"
-  echo "  1) Reload your shell so PATH + helpers apply:   source ~/.bashrc"
+  echo "  1) Reload your shell so PATH applies:            source ~/.bashrc"
   echo "  2) Add a node from a share link or subscription (base64 or Clash):"
   echo "         xraycli add   '<share-link>'"
   echo "         xraycli sub set '<subscription-url>' && xraycli update"
   echo "  3) Start it and check status:"
   echo "         xraycli enable      # start now + auto-start on boot"
   echo "         xraycli status"
-  echo "  4) Point your shell at the proxy:               proxyon   (proxyoff to stop)"
+  echo "  4) Proxy ports (point your apps/shell at these):  xraycli port"
   echo
   echo "Uninstall cleanly at any time:  xraycli uninstall"
 }
@@ -487,17 +472,8 @@ run_wizard() {
     "$xr" status  || true
   fi
 
-  # 3) wire the proxy into Claude Code / Codex
   echo
-  if ask "3) Route Claude Code through this proxy? (~/.claude/settings.json)" n; then
-    "$xr" claude || warn "could not update ~/.claude/settings.json"
-  fi
-  if ask "   Route Codex through this proxy? (~/.codex/.env)" n; then
-    "$xr" codex  || warn "could not update ~/.codex/.env"
-  fi
-
-  echo
-  ok "wizard complete. Re-run any step later:  xraycli sub / enable / claude / codex"
+  ok "wizard complete. Node/proxy commands any time:  xraycli list / port / claude / codex"
 }
 
 # --------------------------------------------------------------------------- #

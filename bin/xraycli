@@ -1112,7 +1112,7 @@ ${c_bld}Maintenance${c_rst}
   uninstall [-y] [--keep-config] [--disable-linger]   remove everything cleanly
   help                  this message
 
-Local proxies (after 'source ~/.bashrc'): ${c_dim}proxyon${c_rst} / ${c_dim}proxyoff${c_rst} toggle shell proxy env vars.
+Proxy ports (point your apps/shell at these): ${c_dim}xraycli port${c_rst}
 EOF
 }
 
