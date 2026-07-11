@@ -435,6 +435,63 @@ cmd_config() {
 }
 
 # --------------------------------------------------------------------------- #
+#  Commands: wire the HTTP proxy into Claude Code / Codex                      #
+# --------------------------------------------------------------------------- #
+# Both tools honour HTTP_PROXY / HTTPS_PROXY. We point them at this install's
+# current HTTP inbound. `off` removes the proxy vars again, leaving other
+# settings untouched.
+proxy_http_url() { printf 'http://%s:%s' "$LISTEN" "$HTTP_PORT"; }
+
+cmd_claude() {  # xraycli claude [on|off]  ->  ~/.claude/settings.json  (.env block)
+  load_env; need_jq
+  local action="${1:-on}"
+  local dir="$HOME/.claude" file="$HOME/.claude/settings.json" tmp
+  mkdir -p "$dir"
+  [ -s "$file" ] || printf '{}\n' > "$file"
+  jq -e . "$file" >/dev/null 2>&1 || die "$file is not valid JSON — fix or remove it, then retry"
+  tmp="$(mktemp)"
+  case "$action" in
+    off)
+      jq 'if has("env") then .env |= del(.HTTP_PROXY, .HTTPS_PROXY, .NO_PROXY) else . end
+          | if (.env == {}) then del(.env) else . end' "$file" > "$tmp" && mv "$tmp" "$file" \
+        && ok "Claude Code: removed proxy env from $file"
+      ;;
+    on|"")
+      local u; u="$(proxy_http_url)"
+      jq --arg u "$u" --arg np "localhost,127.0.0.1,::1" \
+         '.env = ((.env // {}) + {HTTP_PROXY:$u, HTTPS_PROXY:$u, NO_PROXY:$np})' "$file" > "$tmp" \
+        && mv "$tmp" "$file" \
+        && ok "Claude Code -> $u   (wrote $file; restart Claude Code to apply)"
+      ;;
+    *) rm -f "$tmp"; die "usage: xraycli claude [on|off]" ;;
+  esac
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+cmd_codex() {  # xraycli codex [on|off]  ->  ~/.codex/.env  (KEY=value lines)
+  load_env
+  local action="${1:-on}"
+  local dir="$HOME/.codex" file="$HOME/.codex/.env" tmp
+  mkdir -p "$dir"; touch "$file"
+  tmp="$(mktemp)"
+  # keep every line except the three we manage, then (re)append when turning on
+  grep -vE '^[[:space:]]*(HTTP_PROXY|HTTPS_PROXY|NO_PROXY)=' "$file" > "$tmp" || true
+  case "$action" in
+    off)
+      mv "$tmp" "$file"; ok "Codex: removed proxy env from $file"
+      ;;
+    on|"")
+      local u; u="$(proxy_http_url)"
+      { printf 'HTTP_PROXY=%s\n'  "$u"
+        printf 'HTTPS_PROXY=%s\n' "$u"
+        printf 'NO_PROXY=%s\n'    "localhost,127.0.0.1,::1"; } >> "$tmp"
+      mv "$tmp" "$file"; ok "Codex -> $u   (wrote $file; restart Codex to apply)"
+      ;;
+    *) rm -f "$tmp"; die "usage: xraycli codex [on|off]" ;;
+  esac
+}
+
+# --------------------------------------------------------------------------- #
 #  Commands: nodes / subscription                                             #
 # --------------------------------------------------------------------------- #
 cmd_list() {
@@ -1016,6 +1073,10 @@ ${c_bld}Config${c_rst}
   config [show|path|edit|regen]   view / edit / rebuild config.json
   version               print xraycli + xray versions
 
+${c_bld}App integration${c_rst}  ${c_dim}(point AI CLIs at this proxy's HTTP inbound)${c_rst}
+  claude [on|off]       write/remove HTTP proxy in ~/.claude/settings.json
+  codex  [on|off]       write/remove HTTP proxy in ~/.codex/.env
+
 ${c_bld}Maintenance${c_rst}
   uninstall [-y] [--keep-config] [--disable-linger]   remove everything cleanly
   help                  this message
@@ -1052,6 +1113,8 @@ main() {
     direct)           cmd_direct "$@" ;;
     port|ports)       cmd_port "$@" ;;
     config|conf)      cmd_config "$@" ;;
+    claude|claude-code) cmd_claude "$@" ;;
+    codex)            cmd_codex "$@" ;;
     service)          case "${1:-}" in
                         install)
                           if use_systemd; then write_service_unit; ok "installed service unit -> $SERVICE_FILE"

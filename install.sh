@@ -27,6 +27,7 @@
 #   --listen <addr>      Local listen address   (default: 127.0.0.1)
 #   --no-service         Do not install/enable the systemd user service
 #   --no-bashrc          Do not modify ~/.bashrc
+#   --no-wizard          Skip the interactive setup wizard at the end
 #   --mirror <prefix>    Prefix prepended to the GitHub download URL (for CN mirrors)
 #   -h, --help           Show this help
 #
@@ -73,6 +74,7 @@ LISTEN_ADDR="127.0.0.1"
 DO_SERVICE=1
 DO_BASHRC=1
 DO_DEPS=1
+DO_WIZARD=1                 # 1 → run the interactive setup wizard at the end
 MIRROR=""
 
 # Username-derived port window. Same $USER always maps to the same SOCKS base,
@@ -116,6 +118,7 @@ Options:
   --no-service         Do not install/enable the systemd user service
   --no-bashrc          Do not modify ~/.bashrc
   --no-deps            Do not attempt to install missing dependencies
+  --no-wizard          Skip the interactive setup wizard at the end
   --mirror <prefix>    Prefix prepended to the GitHub download URL (CN mirrors)
   -h, --help           Show this help
 EOF
@@ -136,6 +139,7 @@ while [ $# -gt 0 ]; do
     --no-service) DO_SERVICE=0; shift ;;
     --no-bashrc)  DO_BASHRC=0; shift ;;
     --no-deps)    DO_DEPS=0; shift ;;
+    --no-wizard)  DO_WIZARD=0; shift ;;
     -h|--help)    usage 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -443,6 +447,61 @@ summary() {
   echo "Uninstall cleanly at any time:  xraycli uninstall"
 }
 
+# yes/no helper: prints "$1 [Y/n] " (default yes) or "[y/N] " (default no).
+# Returns 0 for yes. Non-interactive → the default.
+ask() {  # ask <prompt> <default:y|n>
+  local prompt="$1" def="${2:-y}" ans hint
+  case "$def" in y) hint="[Y/n]" ;; *) hint="[y/N]" ;; esac
+  if [ ! -t 0 ]; then [ "$def" = y ]; return; fi
+  read -rp "$prompt $hint " ans || true
+  ans="${ans:-$def}"
+  case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+run_wizard() {
+  [ "$DO_WIZARD" -eq 1 ] || return 0
+  local xr="$BIN_DIR/xraycli" url
+  if [ ! -t 0 ]; then
+    info "non-interactive session — skipping the setup wizard"
+    return 0
+  fi
+  echo
+  printf '%s— setup wizard —%s  (Enter takes the [default]; answers below are optional)\n' \
+    "$c_bld" "$c_rst"
+
+  # 1) subscription / first node
+  echo
+  if ask "1) Import a subscription now?" y; then
+    read -rp "   Paste the subscription URL (blank = skip): " url || true
+    if [ -n "${url:-}" ]; then
+      if "$xr" sub set "$url" && "$xr" update; then
+        "$xr" list || true
+      else
+        warn "import failed — retry later with:  xraycli sub set '<url>' && xraycli update"
+      fi
+    fi
+  fi
+
+  # 2) start now + auto-start on boot
+  echo
+  if ask "2) Start the proxy now and auto-start it on boot?" y; then
+    "$xr" enable  || warn "could not enable — retry later with:  xraycli enable"
+    "$xr" status  || true
+  fi
+
+  # 3) wire the proxy into Claude Code / Codex
+  echo
+  if ask "3) Route Claude Code through this proxy? (~/.claude/settings.json)" n; then
+    "$xr" claude || warn "could not update ~/.claude/settings.json"
+  fi
+  if ask "   Route Codex through this proxy? (~/.codex/.env)" n; then
+    "$xr" codex  || warn "could not update ~/.codex/.env"
+  fi
+
+  echo
+  ok "wizard complete. Re-run any step later:  xraycli sub / enable / claude / codex"
+}
+
 # --------------------------------------------------------------------------- #
 #  Run                                                                         #
 # --------------------------------------------------------------------------- #
@@ -457,5 +516,6 @@ main() {
   install_service
   patch_bashrc
   summary
+  run_wizard
 }
 main "$@"

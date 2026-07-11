@@ -55,6 +55,11 @@ straight through, e.g. `… /install.sh) --no-service`.
 > Prefer `bash <(curl …)` over `curl … | bash` — it keeps your terminal on
 > stdin, so confirmation prompts still work.
 
+When run interactively, the installer finishes with a short **setup wizard** that
+offers to (1) import a subscription, (2) start the proxy and enable boot
+auto-start, and (3) route Claude Code / Codex through it. Every step is optional
+and repeatable later; skip the whole thing with `--no-wizard`.
+
 ### From a checkout
 
 ```bash
@@ -81,6 +86,7 @@ source ~/.bashrc
 | `--no-service` | Skip installing/enabling the systemd user service |
 | `--no-bashrc` | Do not modify `~/.bashrc` |
 | `--no-deps` | Do not auto-install missing dependencies |
+| `--no-wizard` | Skip the interactive setup wizard at the end |
 | `--mirror PREFIX` | Prefix prepended to the GitHub download URL (for CN mirrors) |
 
 ---
@@ -111,6 +117,10 @@ Config
   xraycli config [show|path|edit|regen]
   xraycli version
 
+App integration
+  xraycli claude [on|off]         # write/remove HTTP proxy in ~/.claude/settings.json
+  xraycli codex  [on|off]         # write/remove HTTP proxy in ~/.codex/.env
+
 Maintenance
   xraycli uninstall [-y] [--keep-config] [--disable-linger]
 ```
@@ -129,6 +139,19 @@ Or configure an app directly with the ports shown by `xraycli port`
 (SOCKS5 at `127.0.0.1:<socks>`, HTTP at `127.0.0.1:<http>`).
 
 ### Route Claude Code / Codex through the proxy
+
+**The one-command way** — xraycli writes the current HTTP proxy into the right
+file for you (and can remove it again):
+
+```bash
+xraycli claude        # -> ~/.claude/settings.json   (merges into its "env" block)
+xraycli codex         # -> ~/.codex/.env
+xraycli claude off    # remove the proxy vars again (codex off likewise)
+```
+
+It always uses this install's live HTTP port, preserves any other settings in
+those files, and reminds you to restart the app. The manual equivalent, if you
+prefer to edit by hand:
 
 Both tools honour the standard `HTTP_PROXY` / `HTTPS_PROXY` variables — point them
 at xraycli's **HTTP** inbound (the port from `xraycli port`; `10809` below is just

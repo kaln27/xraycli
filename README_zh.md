@@ -46,6 +46,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh
 
 > 建议用 `bash <(curl …)` 而不是 `curl … | bash`：前者会保留终端 stdin，交互确认才能正常工作。
 
+在交互式运行时，安装脚本最后会进入一个简短的**设置向导**，依次引导你：(1) 导入订阅，
+(2) 启动代理并设为开机自启，(3) 把 Claude Code / Codex 接到代理上。每一步都是可选的、
+以后也能单独再来一遍；想整体跳过就加 `--no-wizard`。
+
 ### 从源码安装
 
 ```bash
@@ -72,6 +76,7 @@ source ~/.bashrc
 | `--no-service` | 不安装/启用系统服务 |
 | `--no-bashrc` | 不修改 `~/.bashrc` |
 | `--no-deps` | 不自动安装缺失依赖 |
+| `--no-wizard` | 跳过安装结束时的交互式设置向导 |
 | `--mirror PREFIX` | 给 GitHub 下载地址加前缀（国内镜像加速用） |
 
 ---
@@ -205,6 +210,16 @@ proxyoff                       # 取消
 
 ### 让 Claude Code / Codex 走代理
 
+**一条命令搞定** —— xraycli 会把当前的 HTTP 代理写进对应文件（也能再移除）：
+
+```bash
+xraycli claude        # -> ~/.claude/settings.json（合并进它的 "env" 块）
+xraycli codex         # -> ~/.codex/.env
+xraycli claude off    # 再把代理变量移除（codex off 同理）
+```
+
+它始终用本次安装的实际 HTTP 端口，保留文件里其它设置，并提示你重启对应应用。若你更想手动改，下面是等价做法：
+
 这两个工具都认标准的 `HTTP_PROXY` / `HTTPS_PROXY` 变量 —— 把它们指向 xraycli 的 **HTTP** 入站
 （端口用 `xraycli port` 查看；下面的 `10809` 只是默认值，请换成你自己的）。配置前先确认代理已在运行：
 `xraycli status` / `xraycli test`。
@@ -260,6 +275,10 @@ HTTPS_PROXY=http://127.0.0.1:10809
   xraycli port                # 打印本地代理端口
   xraycli config [show|path|edit|regen]
   xraycli version
+
+应用集成
+  xraycli claude [on|off]     # 把 HTTP 代理写入/移除 ~/.claude/settings.json
+  xraycli codex  [on|off]     # 把 HTTP 代理写入/移除 ~/.codex/.env
 
 维护
   xraycli uninstall [-y] [--keep-config] [--disable-linger]
