@@ -55,9 +55,9 @@ straight through, e.g. `… /install.sh) --no-service`.
 > stdin, so confirmation prompts still work.
 
 When run interactively, the installer finishes with a short **setup wizard** that
-offers to (1) import a subscription and (2) start the proxy and enable boot
-auto-start. Both steps are optional and repeatable later; skip the wizard with
-`--no-wizard`.
+offers to (1) import a subscription, (2) start the proxy and enable boot
+auto-start, and (3) route Claude Code / Codex through it. Every step is optional
+and repeatable later; skip the whole thing with `--no-wizard`.
 
 ### From a checkout
 

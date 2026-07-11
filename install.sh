@@ -472,8 +472,17 @@ run_wizard() {
     "$xr" status  || true
   fi
 
+  # 3) wire the proxy into Claude Code / Codex
   echo
-  ok "wizard complete. Node/proxy commands any time:  xraycli list / port / claude / codex"
+  if ask "3) Route Claude Code through this proxy? (~/.claude/settings.json)" n; then
+    "$xr" claude || warn "could not update ~/.claude/settings.json"
+  fi
+  if ask "   Route Codex through this proxy? (~/.codex/.env)" n; then
+    "$xr" codex  || warn "could not update ~/.codex/.env"
+  fi
+
+  echo
+  ok "wizard complete. Re-run any step later:  xraycli sub / enable / claude / codex"
 }
 
 # --------------------------------------------------------------------------- #

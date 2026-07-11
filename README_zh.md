@@ -46,7 +46,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh
 > 建议用 `bash <(curl …)` 而不是 `curl … | bash`：前者会保留终端 stdin，交互确认才能正常工作。
 
 在交互式运行时，安装脚本最后会进入一个简短的**设置向导**，依次引导你：(1) 导入订阅，
-(2) 启动代理并设为开机自启。每一步都是可选的、以后也能单独再来一遍；想跳过向导就加 `--no-wizard`。
+(2) 启动代理并设为开机自启，(3) 把 Claude Code / Codex 接到代理上。每一步都是可选的、
+以后也能单独再来一遍；想整体跳过就加 `--no-wizard`。
 
 ### 从源码安装
 
