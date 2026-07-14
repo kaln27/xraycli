@@ -234,6 +234,11 @@ Both modes present the identical `start`/`stop`/`restart`/`status`/`enable`/
 | --- | --- | --- |
 | **base64 / raw** | a (base64-wrapped) list of `vless://`, `vmess://`, `trojan://`, `ss://` links | decoded, one node per link |
 | **Clash** | a YAML doc with a `proxies:` list | each proxy under `proxies:` becomes a node |
+| **Clash + providers** | a YAML doc with a `proxy-providers:` block (with or without an inline `proxies:` list) | each provider's `url:` is fetched and its `proxies:` parsed too — inline and provider nodes are merged |
+
+For the `proxy-providers` case, xraycli reads each provider's own `url:` (not the
+`health-check` URL), fetches it, and parses the `proxies:` it returns. Multiple
+providers are all expanded and combined.
 
 ```bash
 xraycli sub set 'https://example.com/sub/xxxx'   # save your subscription URL

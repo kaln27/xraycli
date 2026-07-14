@@ -292,6 +292,10 @@ HTTPS_PROXY=http://127.0.0.1:10809
 | --- | --- | --- |
 | **base64 / raw** | 一串（base64 包裹的）`vless://`、`vmess://`、`trojan://`、`ss://` 链接 | 解码后每行一个节点 |
 | **Clash** | 含 `proxies:` 列表的 YAML | `proxies:` 下每个代理转成一个节点 |
+| **Clash + provider** | 含 `proxy-providers:` 块的 YAML（可有可无 inline `proxies:`） | 取每个 provider 的 `url:` 再请求一次，解析它返回的 `proxies:`；inline 与 provider 的节点合并 |
+
+对于 `proxy-providers` 这种：xraycli 会取每个 provider **自己的** `url:`（不是 `health-check` 里的
+url），请求它，再解析返回内容里的 `proxies:`。多个 provider 会全部展开并合并。
 
 ### 支持的节点协议
 

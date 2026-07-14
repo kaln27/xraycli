@@ -845,6 +845,38 @@ clash_to_descriptors() {  # YAML on stdin -> one descriptor JSON per line
   done
 }
 
+# Extract the subscription URL of each provider under a Clash `proxy-providers:`
+# block. Emits one URL per line. Crucially, it returns a provider's *own* `url:`
+# (a direct child of the provider map) and NOT the `url:` nested under its
+# `health-check:` — the indentation/stack depth tells the two apart.
+read -r -d '' CLASH_PROVIDER_AWK <<'AWK' || true
+function ind(s,  n){ n=0; while(substr(s,n+1,1)==" ") n++; return n }
+function trim(s){ gsub(/^[ \t]+|[ \t]+$/,"",s); return s }
+function unq(s){ if(s ~ /^".*"$/ || s ~ /^'\''.*'\''$/) s=substr(s,2,length(s)-2); return s }
+BEGIN{ inpp=0; ppind=0; sp=0 }
+{
+  line=$0; sub(/\r$/,"",line)
+  if(line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/) next
+  i=ind(line); c=substr(line,i+1)
+  if(!inpp){
+    if(c ~ /^proxy-providers[ \t]*:/){ inpp=1; ppind=i; sp=0 }
+    next
+  }
+  if(i<=ppind){                                  # dedented out of the block
+    inpp=0
+    if(c ~ /^proxy-providers[ \t]*:/){ inpp=1; ppind=i; sp=0 }
+    next
+  }
+  pos=index(c,":"); if(pos==0) next
+  k=trim(substr(c,1,pos-1)); v=trim(substr(c,pos+1))
+  while(sp>0 && stkind[sp]>=i) sp--             # pop to current depth
+  if(v==""){ sp++; stkind[sp]=i; next }         # a nested map key
+  if(k=="url" && sp==1) print unq(v)            # provider_name > url  (depth 1)
+}
+AWK
+
+clash_provider_urls() { awk "$CLASH_PROVIDER_AWK"; }  # Clash YAML on stdin -> urls
+
 sublist_to_descriptors() {  # decoded/raw link list on stdin -> descriptors
   local line d
   while IFS= read -r line || [ -n "$line" ]; do
@@ -868,13 +900,52 @@ fetch_url() {  # <url|path> -> stdout
 
 detect_format() {  # <file> -> clash | base64 | raw | unknown
   local f="$1" dec
-  if grep -qiE '^[[:space:]]*proxies[[:space:]]*:' "$f" || grep -qi 'proxy-groups' "$f"; then
+  if grep -qiE '^[[:space:]]*proxies[[:space:]]*:' "$f" \
+     || grep -qiE '^[[:space:]]*proxy-providers[[:space:]]*:' "$f" \
+     || grep -qi 'proxy-groups' "$f"; then
     echo clash; return
   fi
   dec="$(tr -d '[:space:]' < "$f" | b64d)"
   if printf '%s' "$dec" | grep -q '://'; then echo base64; return; fi
   if grep -q '://' "$f"; then echo raw; return; fi
   echo unknown
+}
+
+# Turn a fetched subscription FILE into descriptor JSON lines. For Clash docs
+# this parses any inline `proxies:` AND expands every `proxy-providers:` entry —
+# fetching each provider's url (which itself carries the real `proxies:`) and
+# parsing that too. <depth> guards against a provider that points back at itself.
+descriptors_from_content() {  # <file> [depth] -> descriptors on stdout
+  local f="$1" depth="${2:-0}" fmt descs urls u ptmp pd
+  fmt="$(detect_format "$f")"
+  case "$fmt" in
+    base64) tr -d '[:space:]' < "$f" | b64d | sublist_to_descriptors; return ;;
+    raw)    sublist_to_descriptors < "$f"; return ;;
+    unknown) return 1 ;;
+    clash) : ;;
+  esac
+
+  descs="$(clash_to_descriptors < "$f")"           # inline proxies (may be empty)
+
+  urls="$(clash_provider_urls < "$f")"
+  if [ -n "$urls" ]; then
+    while IFS= read -r u; do
+      [ -n "$u" ] || continue
+      if [ "$depth" -ge 2 ]; then
+        warn "proxy-provider nesting too deep — skipping: $u"; continue
+      fi
+      info "expanding proxy-provider: $u" >&2
+      ptmp="$(mktemp)"
+      if fetch_url "$u" > "$ptmp" 2>/dev/null && [ -s "$ptmp" ]; then
+        pd="$(descriptors_from_content "$ptmp" $((depth+1)))"
+        [ -n "$pd" ] && descs="${descs:+$descs$'\n'}$pd"
+      else
+        warn "proxy-provider fetch failed or empty: $u"
+      fi
+      rm -f "$ptmp"
+    done <<< "$urls"
+  fi
+  printf '%s' "$descs"
 }
 
 unique_name() {  # <base> <nodes-json> -> a name not present in nodes
@@ -908,11 +979,7 @@ do_import() {  # <url|file> <replace|append>
   fmt="$(detect_format "$tmp")"
   [ "$fmt" = unknown ] && { rm -f "$tmp"; die "unrecognised subscription format (expected Clash YAML or base64/raw links)"; }
   info "detected subscription format: $fmt"
-  case "$fmt" in
-    clash)  descs="$(clash_to_descriptors < "$tmp")" ;;
-    base64) descs="$(tr -d '[:space:]' < "$tmp" | b64d | sublist_to_descriptors)" ;;
-    raw)    descs="$(sublist_to_descriptors < "$tmp")" ;;
-  esac
+  descs="$(descriptors_from_content "$tmp" 0)"     # parses proxies + proxy-providers
   rm -f "$tmp"
   [ -n "$descs" ] || die "no nodes found in the subscription"
 
