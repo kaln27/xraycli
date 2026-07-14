@@ -509,8 +509,8 @@ cmd_list() {
   local rows
   rows="$(jq -r --arg cur "$cur" '
     def ep:
-      (.outbound.settings.vnext[0] // .outbound.settings.servers[0]) as $e
-      | if $e then "\($e.address):\($e.port)" else "-" end;
+      (.outbound.settings.vnext[0] // .outbound.settings.servers[0] // .outbound.settings) as $e
+      | if ($e.address // null) != null then "\($e.address):\($e.port)" else "-" end;
     def ns:
       "\(.outbound.streamSettings.network // "tcp")/\(.outbound.streamSettings.security // "none")";
     def proto:
@@ -587,7 +587,7 @@ cmd_direct() {
 #    * clash        : a YAML doc whose nodes live under the `proxies:` key     #
 #  Each parser normalises a node into a "descriptor" JSON, and build_outbound  #
 #  turns a descriptor into a real Xray outbound. Protocols Xray-core cannot    #
-#  run (hysteria2, tuic, …) are recognised and skipped with a clear report.    #
+#  run (tuic, hysteria2-with-obfs, …) are recognised & skipped with a report.  #
 # --------------------------------------------------------------------------- #
 
 urldecode() { local s="${1//+/ }"; s="${s//%/\\x}"; printf '%b' "$s"; }
@@ -696,6 +696,30 @@ parse_ss_uri() {
   emit_descriptor shadowsocks "$name" "$host" "$port" method="$method" password="$pass" network="tcp" security="none"
 }
 
+parse_hysteria2_uri() {  # hysteria2://<auth>@host:port?params#name   (hy2:// alias)
+  local uri="$1" rest name query userinfo hostport host port
+  rest="${uri#*://}"
+  name=""; case "$rest" in *"#"*) name="$(urldecode "${rest##*#}")"; rest="${rest%%#*}";; esac
+  query=""; case "$rest" in *"?"*) query="${rest#*\?}"; rest="${rest%%\?*}";; esac
+  userinfo="${rest%@*}"; hostport="${rest##*@}"
+  host="${hostport%:*}"; port="${hostport##*:}"
+  local sni="" obfs="" obfspw="" insecure="" alpn="" ports="" up="" down=""
+  local IFS='&' kv k v
+  for kv in $query; do
+    [ -z "$kv" ] && continue
+    k="${kv%%=*}"; v="$(urldecode "${kv#*=}")"
+    case "$k" in
+      sni|peer) sni="$v";; obfs) obfs="$v";; obfs-password|obfsParam) obfspw="$v";;
+      insecure|allowInsecure) insecure="$v";; alpn) alpn="$v";;
+      mport|ports) ports="$v";; up|upmbps) up="$v";; down|downmbps) down="$v";;
+    esac
+  done
+  # hysteria2 URIs sometimes carry auth as user:pass — Xray uses the whole string
+  emit_descriptor hysteria2 "$name" "$host" "$port" \
+    password="$userinfo" sni="$sni" obfs="$obfs" obfsPassword="$obfspw" \
+    insecure="$insecure" alpn="$alpn" ports="$ports" up="$up" down="$down"
+}
+
 parse_unsupported_uri() {  # keep name/host so import can report what was skipped
   local uri="$1" scheme="${1%%://*}" rest name hostport host="" port=""
   rest="${uri#*://}"
@@ -712,14 +736,17 @@ parse_share_link() {  # <uri> -> descriptor JSON; nonzero on unknown scheme
     vmess)  parse_vmess_uri "$uri" ;;
     trojan) parse_trojan_uri "$uri" ;;
     ss)     parse_ss_uri "$uri" ;;
-    hysteria2|hy2|hysteria|tuic|juicity|wireguard|wg|ssr)
+    hysteria2|hy2) parse_hysteria2_uri "$uri" ;;
+    hysteria|tuic|juicity|wireguard|wg|ssr)
             parse_unsupported_uri "$uri" ;;
     *) return 3 ;;
   esac
 }
 
 # Protocols with no Xray-core outbound — recognised, then skipped on import.
-XRAY_UNSUPPORTED='hysteria2 hy2 hysteria tuic juicity wireguard wg ssr snell'
+# NB: hysteria2/hy2 ARE supported now (Xray's `hysteria` outbound, version 2);
+# plain `hysteria` here means Hysteria v1, which Xray still cannot run.
+XRAY_UNSUPPORTED='hysteria tuic juicity wireguard wg ssr snell'
 
 # Shared jq that turns descriptor fields into an Xray streamSettings object.
 read -r -d '' STREAM_JQ <<'JQ' || true
@@ -774,6 +801,25 @@ build_outbound() {  # <descriptor> -> outbound JSON (tag proxy); return 3 if Xra
       { tag:"proxy", protocol:"shadowsocks",
         settings:{ servers:[ {address:.server, port:(.port|tonumber), method:.method, password:.password} ] },
         streamSettings:{network:((.network // "tcp")), security:"none"} }' <<<"$d" ;;
+    hysteria2)
+      # Xray-core runs Hysteria2, but has NO Salamander obfs (issue #5712, "not
+      # planned"). A config with obfs would parse yet silently fail to connect,
+      # so skip obfs'd nodes rather than import a dead one.
+      case "$(jq -r '.obfs // ""' <<<"$d")" in ""|null) ;; *) return 3;; esac
+      jq -c '
+      def s: if . == null then "" else tostring end;
+      { tag:"proxy", protocol:"hysteria",
+        settings:{ version:2, address:.server, port:(.port|tonumber) },
+        streamSettings:{
+          network:"hysteria",
+          security:"tls",
+          tlsSettings: ( { serverName: ((.sni|s)|if .=="" then (.server|s) else . end) }
+                         + ( if ((.alpn // [])|length) > 0 then {alpn:.alpn} else {} end ) ),
+          hysteriaSettings: ( { version:2, auth:(.password|s) }
+                              + ( if (.up|s)   != "" then {up:(.up|s)}     else {} end )
+                              + ( if (.down|s) != "" then {down:(.down|s)} else {} end )
+                              + ( if (.ports|s) != "" then {udphop:{ports:(.ports|s)}} else {} end ) )
+        } }' <<<"$d" ;;
     *) return 3 ;;
   esac
 }
@@ -825,7 +871,11 @@ clash_to_descriptors() {  # YAML on stdin -> one descriptor JSON per line
     declare -A A=(); local alpn_csv="" k v
     while IFS=$'\t' read -r k v; do
       [ -z "$k" ] && continue
-      if [ "$k" = "alpn" ]; then [ -n "$alpn_csv" ] && alpn_csv="$alpn_csv,$v" || alpn_csv="$v"; continue; fi
+      if [ "$k" = "alpn" ]; then
+        v="${v//[/}"; v="${v//]/}"; v="${v//\"/}"; v="${v// /}"   # tolerate flow-style [h3, h2]
+        [ -n "$v" ] && { [ -n "$alpn_csv" ] && alpn_csv="$alpn_csv,$v" || alpn_csv="$v"; }
+        continue
+      fi
       A["$k"]="$v"
     done <<< "$rec"
     local type="${A[type]:-}"; [ -n "$type" ] || { unset A; continue; }
@@ -835,12 +885,15 @@ clash_to_descriptors() {  # YAML on stdin -> one descriptor JSON per line
     if [ -n "$pbk" ]; then sec="reality"; elif [ "$tls" = "true" ]; then sec="tls"; fi
     local sni="${A[servername]:-${A[sni]:-}}"
     emit_descriptor "$type" "${A[name]:-}" "${A[server]:-}" "${A[port]:-}" \
-      uuid="${A[uuid]:-}" password="${A[password]:-}" flow="${A[flow]:-}" \
+      uuid="${A[uuid]:-}" password="${A[password]:-${A[auth]:-}}" flow="${A[flow]:-}" \
       network="$net" security="$sec" sni="$sni" fp="${A[client-fingerprint]:-}" \
       pbk="$pbk" sid="$sid" spx="${A[reality-opts.spider-x]:-}" alpn="$alpn_csv" \
       wsPath="${A[ws-opts.path]:-}" wsHost="${A[ws-opts.headers.Host]:-}" \
       grpcService="${A[grpc-opts.grpc-service-name]:-}" \
-      alterId="${A[alterId]:-}" scy="${A[cipher]:-}" method="${A[cipher]:-}"
+      alterId="${A[alterId]:-}" scy="${A[cipher]:-}" method="${A[cipher]:-}" \
+      obfs="${A[obfs]:-}" obfsPassword="${A[obfs-password]:-}" \
+      insecure="${A[skip-cert-verify]:-}" ports="${A[ports]:-}" \
+      up="${A[up]:-}" down="${A[down]:-}"
     unset A
   done
 }
@@ -995,15 +1048,19 @@ do_import() {  # <url|file> <replace|append>
       nodes="$(jq -c --arg n "$nm" --argjson ob "$ob" '. + [{name:$n, outbound:$ob}]' <<<"$nodes")"
       added=$((added+1))
     else
+      local why="Xray-core has no '$typ' outbound"
+      if [ "$typ" = hysteria2 ] && [ -n "$(jq -r '.obfs // ""' <<<"$d")" ]; then
+        why="hysteria2 with obfs — Xray-core has no Salamander obfs"
+      fi
       skipped=$((skipped+1)); skips="$skips
-    - $nm ($typ)"
+    - $nm ($typ) — $why"
     fi
   done <<< "$descs"
 
   printf '%s\n' "$nodes" > "$NODES_FILE"
   ok "imported $added node(s) [$fmt, mode=$mode]"
   if [ "$skipped" -gt 0 ]; then
-    warn "skipped $skipped node(s) Xray-core cannot run (hysteria2/tuic/…):$skips"
+    warn "skipped $skipped node(s) Xray-core can't run:$skips"
   fi
   reselect_active
   cmd_list

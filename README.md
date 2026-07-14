@@ -232,7 +232,7 @@ Both modes present the identical `start`/`stop`/`restart`/`status`/`enable`/
 
 | Format | What it looks like | How it's parsed |
 | --- | --- | --- |
-| **base64 / raw** | a (base64-wrapped) list of `vless://`, `vmess://`, `trojan://`, `ss://` links | decoded, one node per link |
+| **base64 / raw** | a (base64-wrapped) list of `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` links | decoded, one node per link |
 | **Clash** | a YAML doc with a `proxies:` list | each proxy under `proxies:` becomes a node |
 | **Clash + providers** | a YAML doc with a `proxy-providers:` block (with or without an inline `proxies:` list) | each provider's `url:` is fetched and its `proxies:` parsed too — inline and provider nodes are merged |
 
@@ -256,13 +256,22 @@ per fetch are picked up automatically); otherwise it selects the first node.
 ### Supported node protocols
 
 Xray-core runs **VLESS** (incl. REALITY + XTLS-Vision), **VMess**, **Trojan**,
-and **Shadowsocks**, over `tcp` / `ws` / `grpc` / `h2` with `tls` / `reality`.
+and **Shadowsocks**, over `tcp` / `ws` / `grpc` / `h2` with `tls` / `reality`,
+plus **Hysteria2** (`hysteria2://` / `hy2://` links and Clash `type: hysteria2`,
+including port-hopping via `ports`).
 
-Protocols Xray-core has **no outbound for** — `hysteria2`, `tuic`, `wireguard`,
-`ssr`, … — are recognised and **skipped** on import with a clear report (and
-refused by `add`), rather than silently breaking the config. If your
-subscription mixes, say, a VLESS and a hysteria2 node, only the VLESS one is
-imported and you'll see `skipped 1 node(s) …`.
+> **Hysteria2 caveat — Salamander obfs.** Xray-core supports Hysteria2 but has
+> **no Salamander obfs** ([XTLS/Xray-core#5712](https://github.com/XTLS/Xray-core/issues/5712),
+> closed as *not planned*). A node with `obfs: salamander` would produce a config
+> that loads yet silently fails to connect, so xraycli **skips** obfs'd hysteria2
+> nodes with a clear reason. Hysteria2 nodes **without** obfs import and run.
+> (Also note: Xray 26.x removed blanket `allowInsecure`/`skip-cert-verify`, so
+> that flag is dropped — the server needs a cert valid for its SNI.)
+
+Protocols Xray-core genuinely has **no outbound for** — `tuic`, `wireguard`,
+`ssr`, `snell`, `hysteria` (v1), … — are recognised and **skipped** on import
+with a clear report (and refused by `add`), rather than silently breaking the
+config. You'll see `skipped N node(s) Xray-core can't run: …` naming each.
 
 Each stored node has the shape `{ "name": …, "outbound": { …Xray outbound… } }`
 in `~/.config/xraycli/nodes.json`.
