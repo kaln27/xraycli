@@ -92,9 +92,9 @@ PORT_WINDOW_SLOTS=4000
 # --------------------------------------------------------------------------- #
 if [ -t 1 ]; then
   c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
-  c_blu=$'\033[34m'; c_bld=$'\033[1m'; c_rst=$'\033[0m'
+  c_blu=$'\033[34m'; c_dim=$'\033[2m'; c_bld=$'\033[1m'; c_rst=$'\033[0m'
 else
-  c_red=; c_grn=; c_ylw=; c_blu=; c_bld=; c_rst=
+  c_red=; c_grn=; c_ylw=; c_blu=; c_dim=; c_bld=; c_rst=
 fi
 info()  { printf '%s==>%s %s\n' "$c_blu"  "$c_rst" "$*"; }
 ok()    { printf '%s ✓ %s %s\n' "$c_grn"  "$c_rst" "$*"; }
