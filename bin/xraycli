@@ -32,7 +32,10 @@ readonly APP="xraycli"
 readonly BIN_SELF="$HOME/.local/bin/xraycli"
 readonly DATA_DIR="$XDG_DATA_HOME/$APP"
 readonly CORE_DIR="$DATA_DIR/core"
-readonly CORE_BIN="$CORE_DIR/xray"
+# Which proxy core runs the tunnel. Resolved from XRAYCLI_CORE in load_env;
+# CORE_BIN is derived from it. Both cores may coexist in CORE_DIR.
+CORE="xray"
+CORE_BIN="$CORE_DIR/xray"
 readonly CONFIG_DIR="$XDG_CONFIG_HOME/$APP"
 readonly STATE_DIR="$XDG_STATE_HOME/$APP"
 readonly SERVICE_NAME="$APP.service"
@@ -45,7 +48,8 @@ SERVICE_FILE="$SYSTEMD_DIR/$SERVICE_NAME"
 readonly ENV_FILE="$CONFIG_DIR/xraycli.env"
 readonly CONFIG_FILE="$CONFIG_DIR/config.json"
 readonly NODES_FILE="$CONFIG_DIR/nodes.json"
-readonly ACTIVE_OUTBOUND="$CONFIG_DIR/active_outbound.json"
+readonly ACTIVE_OUTBOUND="$CONFIG_DIR/active_outbound.json"   # legacy (xray outbound)
+readonly ACTIVE_DESC="$CONFIG_DIR/active_descriptor.json"     # active node descriptor
 readonly ACTIVE_NAME_FILE="$CONFIG_DIR/active_name"
 readonly SUB_FILE="$CONFIG_DIR/subscription"
 readonly PID_FILE="$STATE_DIR/xray.pid"
@@ -78,21 +82,55 @@ need_jq() { have jq || die "jq is required for node management — install it (e
 # --------------------------------------------------------------------------- #
 load_env() {
   LISTEN="127.0.0.1"; SOCKS_PORT="10808"; HTTP_PORT="10809"; XRAYCLI_VERSION="unknown"
+  XRAYCLI_CORE="xray"
   # shellcheck disable=SC1090
   [ -f "$ENV_FILE" ] && . "$ENV_FILE"
   LISTEN="${XRAYCLI_LISTEN:-$LISTEN}"
   SOCKS_PORT="${XRAYCLI_SOCKS_PORT:-$SOCKS_PORT}"
   HTTP_PORT="${XRAYCLI_HTTP_PORT:-$HTTP_PORT}"
   XRAYCLI_VERSION="${XRAYCLI_VERSION:-unknown}"
+  case "${XRAYCLI_CORE:-xray}" in sing-box|singbox) CORE="sing-box" ;; *) CORE="xray" ;; esac
+  CORE_BIN="$CORE_DIR/$CORE"
+}
+
+# --------------------------------------------------------------------------- #
+#  Core abstraction — everything core-specific funnels through these           #
+# --------------------------------------------------------------------------- #
+core_check() { # validate <cfg>; 0 = ok
+  local f="${1:-$CONFIG_FILE}"
+  if [ "$CORE" = sing-box ]; then "$CORE_BIN" check -c "$f" >/dev/null 2>&1
+  else XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" -test -config "$f" >/dev/null 2>&1; fi
+}
+core_run_cmd() {  # print the run command for the systemd ExecStart line
+  if [ "$CORE" = sing-box ]; then printf '%s run -c %s' "$CORE_BIN" "$CONFIG_FILE"
+  else printf '%s run -config %s' "$CORE_BIN" "$CONFIG_FILE"; fi
+}
+
+# Which node types the ACTIVE core can actually run. hasObfs=1 means the node
+# carries (salamander) obfs. Xray can't do obfs'd hysteria2; sing-box can.
+core_supports() {  # <type> <hasObfs>
+  local t="$1" obfs="${2:-0}"
+  case "$t" in
+    vless|vmess|trojan|shadowsocks) return 0 ;;
+    hysteria2)
+      [ "$CORE" = sing-box ] && return 0
+      [ "$obfs" = 1 ] && return 1   # xray: no Salamander obfs
+      return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 ensure_installed() {
-  [ -x "$CORE_BIN" ] || die "Xray core not found at $CORE_BIN — run install.sh first"
+  [ -x "$CORE_BIN" ] || die "$CORE core not found at $CORE_BIN — run install.sh (or: xraycli core <name>)"
 }
 
 core_version() {
   [ -x "$CORE_BIN" ] || { echo "n/a"; return; }
-  XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" version 2>/dev/null | head -1 | awk '{print $2}'
+  if [ "$CORE" = sing-box ]; then
+    "$CORE_BIN" version 2>/dev/null | head -1 | awk '{print $3}'
+  else
+    XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" version 2>/dev/null | head -1 | awk '{print $2}'
+  fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -143,17 +181,18 @@ write_service_unit() {
   mkdir -p "$SYSTEMD_DIR"
   # Absolute paths (NOT %h): xraycli's files live under this shell's $HOME, which
   # may differ from the manager's home that %h would expand to.
+  local env_line=""
+  [ "$CORE" = xray ] && env_line="Environment=XRAY_LOCATION_ASSET=$CORE_DIR"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Xray proxy (managed by xraycli)
-Documentation=https://github.com/XTLS/Xray-core
+Description=$CORE proxy (managed by xraycli)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=XRAY_LOCATION_ASSET=$CORE_DIR
-ExecStart=$CORE_BIN run -config $CONFIG_FILE
+$env_line
+ExecStart=$(core_run_cmd)
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
@@ -176,9 +215,13 @@ cmd_supervise() {
   _sv_term() { [ -n "$xpid" ] && kill "$xpid" 2>/dev/null; rm -f "$PID_FILE" "$SUPERVISOR_PID"; exit 0; }
   trap _sv_term TERM INT
   while :; do
-    XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" run -config "$CONFIG_FILE" >>"$STATE_DIR/error.log" 2>&1 &
+    if [ "$CORE" = sing-box ]; then
+      "$CORE_BIN" run -c "$CONFIG_FILE" >>"$STATE_DIR/error.log" 2>&1 &
+    else
+      XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" run -config "$CONFIG_FILE" >>"$STATE_DIR/error.log" 2>&1 &
+    fi
     xpid=$!; echo "$xpid" > "$PID_FILE"
-    wait "$xpid"           # returns when xray exits, or is interrupted by a trap
+    wait "$xpid"           # returns when the core exits, or is interrupted by a trap
     sleep 2                # throttle restarts on a crash loop
   done
 }
@@ -233,12 +276,23 @@ restart_if_running() { if is_running; then cmd_restart; fi; }
 cmd_regen() {
   load_env
   mkdir -p "$CONFIG_DIR" "$STATE_DIR"
-  local proxy_ob
-  if [ -f "$ACTIVE_OUTBOUND" ]; then
-    proxy_ob="$(cat "$ACTIVE_OUTBOUND")"
-  else
-    proxy_ob='{ "tag": "proxy", "protocol": "freedom", "settings": {} }'
+  # Resolve the active node's proxy outbound for the CURRENT core.
+  local proxy_ob=""
+  if [ -f "$ACTIVE_DESC" ]; then
+    proxy_ob="$(build_proxy_outbound "$(cat "$ACTIVE_DESC")" 2>/dev/null || true)"
+  elif [ "$CORE" = xray ] && [ -f "$ACTIVE_OUTBOUND" ]; then
+    proxy_ob="$(cat "$ACTIVE_OUTBOUND")"   # legacy pre-descriptor node (xray only)
   fi
+  if [ "$CORE" = sing-box ]; then regen_singbox "$proxy_ob"; else regen_xray "$proxy_ob"; fi
+  if [ -x "$CORE_BIN" ]; then
+    core_check "$CONFIG_FILE" \
+      || warn "generated config did not pass '$CORE' validation (active node may be malformed)"
+  fi
+}
+
+regen_xray() {  # <proxy-outbound-json|"">
+  local proxy_ob="${1:-}"
+  [ -n "$proxy_ob" ] || proxy_ob='{ "tag": "proxy", "protocol": "freedom", "settings": {} }'
   cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
@@ -276,10 +330,28 @@ cmd_regen() {
   }
 }
 EOF
-  if [ -x "$CORE_BIN" ]; then
-    XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_BIN" -test -config "$CONFIG_FILE" >/dev/null 2>&1 \
-      || warn "generated config did not pass 'xray -test' (active node may be malformed)"
-  fi
+}
+
+regen_singbox() {  # <proxy-outbound-json|"">
+  local proxy_ob="${1:-}"
+  [ -n "$proxy_ob" ] || proxy_ob='{ "type": "direct", "tag": "proxy" }'
+  cat > "$CONFIG_FILE" <<EOF
+{
+  "log": { "level": "warn", "output": "$STATE_DIR/error.log", "timestamp": true },
+  "inbounds": [
+    { "type": "socks", "tag": "socks-in", "listen": "$LISTEN", "listen_port": $SOCKS_PORT },
+    { "type": "http",  "tag": "http-in",  "listen": "$LISTEN", "listen_port": $HTTP_PORT }
+  ],
+  "outbounds": [
+    $proxy_ob,
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [ { "ip_is_private": true, "outbound": "direct" } ],
+    "final": "proxy"
+  }
+}
+EOF
 }
 
 # --------------------------------------------------------------------------- #
@@ -374,7 +446,8 @@ cmd_status() {
   is_running && running="${c_grn}running${c_rst}" || running="${c_red}stopped${c_rst}"
   if use_systemd; then mode="systemd user service"; else mode="self-managed supervisor (auto-restart)"; fi
   printf '%s%s%s\n' "$c_bld" "$APP status" "$c_rst"
-  printf '  version : xraycli %s  /  xray %s\n' "$XRAYCLI_VERSION_SELF" "$(core_version)"
+  printf '  version : xraycli %s  /  %s %s\n' "$XRAYCLI_VERSION_SELF" "$CORE" "$(core_version)"
+  printf '  core    : %s\n' "$CORE"
   printf '  listen  : %s   socks %s   http %s\n' "$LISTEN" "$SOCKS_PORT" "$HTTP_PORT"
   printf '  node    : %s\n' "$node"
   printf '  running : %b\n' "$running"
@@ -506,15 +579,22 @@ cmd_list() {
   local cur; cur="$(current_name)"
 
   # One TSV row per node: idx, active(1/0), name, proto, server:port, net/sec.
+  # Reads the node's descriptor; falls back to a legacy prebuilt .outbound.
   local rows
   rows="$(jq -r --arg cur "$cur" '
-    def ep:
-      (.outbound.settings.vnext[0] // .outbound.settings.servers[0] // .outbound.settings) as $e
-      | if ($e.address // null) != null then "\($e.address):\($e.port)" else "-" end;
-    def ns:
-      "\(.outbound.streamSettings.network // "tcp")/\(.outbound.streamSettings.security // "none")";
     def proto:
-      (.outbound.protocol // "?") | if . == "shadowsocks" then "ss" else . end;
+      ( if .descriptor then .descriptor.type
+        else (.outbound.protocol // "?") end )
+      | if .=="shadowsocks" then "ss" elif .=="hysteria" or .=="hysteria2" then "hy2" else . end;
+    def ep:
+      if .descriptor then "\(.descriptor.server):\(.descriptor.port)"
+      else ((.outbound.settings.vnext[0] // .outbound.settings.servers[0] // .outbound.settings) as $e
+            | if ($e.address // null) != null then "\($e.address):\($e.port)" else "-" end) end;
+    def ns:
+      if .descriptor then
+        ( if .descriptor.type=="hysteria2" then "quic/tls"
+          else "\(.descriptor.network // "tcp")/\(.descriptor.security // "none")" end )
+      else "\(.outbound.streamSettings.network // "tcp")/\(.outbound.streamSettings.security // "none")" end;
     to_entries[]
     | [ (.key|tostring),
         (if .value.name == $cur then "1" else "0" end),
@@ -550,12 +630,20 @@ cmd_current() {
 
 cmd_use() {
   need_jq; ensure_nodes
-  local sel="${1:?usage: xraycli use <index|name>}" node name ob
+  local sel="${1:?usage: xraycli use <index|name>}" node name desc typ
   node="$(select_node "$sel")" || die "no such node: $sel  (see: xraycli list)"
   [ -n "$node" ] && [ "$node" != "null" ] || die "no such node: $sel"
   name="$(jq -r '.name' <<<"$node")"
-  ob="$(jq '.outbound | .tag = "proxy"' <<<"$node")"
-  printf '%s\n' "$ob" > "$ACTIVE_OUTBOUND"
+  if jq -e 'has("descriptor")' <<<"$node" >/dev/null 2>&1; then
+    desc="$(jq -c '.descriptor' <<<"$node")"; typ="$(jq -r '.descriptor.type' <<<"$node")"
+    build_proxy_outbound "$desc" >/dev/null 2>&1 \
+      || die "the '$CORE' core can't run node '$name' ($typ) — switch core: xraycli core <name>"
+    printf '%s\n' "$desc" > "$ACTIVE_DESC"; rm -f "$ACTIVE_OUTBOUND"
+  else
+    # legacy node stored a prebuilt Xray outbound
+    [ "$CORE" = xray ] || die "node '$name' predates multi-core — run 'xraycli update' to refresh it for $CORE"
+    jq '.outbound | .tag="proxy"' <<<"$node" > "$ACTIVE_OUTBOUND"; rm -f "$ACTIVE_DESC"
+  fi
   printf '%s\n' "$name" > "$ACTIVE_NAME_FILE"
   cmd_regen
   restart_if_running
@@ -573,7 +661,7 @@ cmd_remove() {
 }
 
 cmd_direct() {
-  rm -f "$ACTIVE_OUTBOUND" "$ACTIVE_NAME_FILE"
+  rm -f "$ACTIVE_OUTBOUND" "$ACTIVE_DESC" "$ACTIVE_NAME_FILE"
   cmd_regen
   restart_if_running
   ok "switched to direct (traffic bypasses any proxy node)"
@@ -585,7 +673,7 @@ cmd_direct() {
 #  Two subscription shapes are auto-detected by content (not by URL):         #
 #    * base64 / raw : a (base64-wrapped) list of vless://, trojan://, … links #
 #    * clash        : a YAML doc whose nodes live under the `proxies:` key     #
-#  Each parser normalises a node into a "descriptor" JSON, and build_outbound  #
+#  Each parser normalises a node into a "descriptor" JSON, and the core builder #
 #  turns a descriptor into a real Xray outbound. Protocols Xray-core cannot    #
 #  run (tuic, hysteria2-with-obfs, …) are recognised & skipped with a report.  #
 # --------------------------------------------------------------------------- #
@@ -743,10 +831,8 @@ parse_share_link() {  # <uri> -> descriptor JSON; nonzero on unknown scheme
   esac
 }
 
-# Protocols with no Xray-core outbound — recognised, then skipped on import.
-# NB: hysteria2/hy2 ARE supported now (Xray's `hysteria` outbound, version 2);
-# plain `hysteria` here means Hysteria v1, which Xray still cannot run.
-XRAY_UNSUPPORTED='hysteria tuic juicity wireguard wg ssr snell'
+# Which protocols each core can run is decided by core_supports(); a descriptor
+# type outside every builder's cases is skipped on import.
 
 # Shared jq that turns descriptor fields into an Xray streamSettings object.
 read -r -d '' STREAM_JQ <<'JQ' || true
@@ -778,9 +864,8 @@ def stream:
       else {} end );
 JQ
 
-build_outbound() {  # <descriptor> -> outbound JSON (tag proxy); return 3 if Xray can't run it
+xray_outbound() {  # <descriptor> -> Xray outbound JSON (tag proxy)
   local d="$1" type; type="$(jq -r '.type' <<<"$d")"
-  case " $XRAY_UNSUPPORTED " in *" $type "*) return 3;; esac
   case "$type" in
     vless) jq -c "$STREAM_JQ"'
       { tag:"proxy", protocol:"vless",
@@ -801,12 +886,7 @@ build_outbound() {  # <descriptor> -> outbound JSON (tag proxy); return 3 if Xra
       { tag:"proxy", protocol:"shadowsocks",
         settings:{ servers:[ {address:.server, port:(.port|tonumber), method:.method, password:.password} ] },
         streamSettings:{network:((.network // "tcp")), security:"none"} }' <<<"$d" ;;
-    hysteria2)
-      # Xray-core runs Hysteria2, but has NO Salamander obfs (issue #5712, "not
-      # planned"). A config with obfs would parse yet silently fail to connect,
-      # so skip obfs'd nodes rather than import a dead one.
-      case "$(jq -r '.obfs // ""' <<<"$d")" in ""|null) ;; *) return 3;; esac
-      jq -c '
+    hysteria2) jq -c '
       def s: if . == null then "" else tostring end;
       { tag:"proxy", protocol:"hysteria",
         settings:{ version:2, address:.server, port:(.port|tonumber) },
@@ -822,6 +902,67 @@ build_outbound() {  # <descriptor> -> outbound JSON (tag proxy); return 3 if Xra
         } }' <<<"$d" ;;
     *) return 3 ;;
   esac
+}
+
+# sing-box outbound (tag "proxy") from a descriptor. sing-box uses server_port,
+# a nested tls{} (with reality/utls), a transport{} for ws/grpc, and native
+# hysteria2 obfs — so it runs the obfs'd nodes Xray can't.
+singbox_outbound() {  # <descriptor> -> sing-box outbound JSON
+  local d="$1" type; type="$(jq -r '.type' <<<"$d")"
+  # shared TLS + transport builders
+  local SB_JQ='
+    def s: if . == null then "" else tostring end;
+    def tls:
+      ( { enabled:true, server_name:((.sni|s)|if .=="" then (.server|s) else . end) }
+        + ( if (.security|s)=="reality" then
+              { utls:{enabled:true, fingerprint:((.fp|s)|if .=="" then "chrome" else . end)},
+                reality:{enabled:true, public_key:(.pbk|s), short_id:(.sid|s)} }
+            else
+              ( if (.fp|s)!="" then {utls:{enabled:true, fingerprint:(.fp|s)}} else {} end ) end )
+        + ( if ((.insecure|s)=="true" or (.insecure|s)=="1") then {insecure:true} else {} end )
+        + ( if ((.alpn // [])|length) > 0 then {alpn:.alpn} else {} end ) );
+    def transport:
+      if (.network|s)=="ws" then
+        { transport: ( { type:"ws", path:((.wsPath|s)|if .=="" then "/" else . end) }
+                       + ( if (.wsHost|s)!="" then {headers:{Host:(.wsHost|s)}} else {} end ) ) }
+      elif (.network|s)=="grpc" then { transport:{ type:"grpc", service_name:(.grpcService|s) } }
+      else {} end;
+    def tlsopt: (if (.security|s)=="reality" or (.security|s)=="tls" or (.security|s)=="xtls" then {tls: tls} else {} end);'
+  case "$type" in
+    vless) jq -c "$SB_JQ"'
+      { type:"vless", tag:"proxy", server:.server, server_port:(.port|tonumber), uuid:.uuid }
+      + ( if (.flow|s)!="" then {flow:.flow} else {} end ) + tlsopt + transport' <<<"$d" ;;
+    vmess) jq -c "$SB_JQ"'
+      { type:"vmess", tag:"proxy", server:.server, server_port:(.port|tonumber), uuid:.uuid,
+        security:((.scy|s)|if .=="" then "auto" else . end),
+        alter_id:((.alterId|s)|if .=="" then 0 else tonumber end) } + tlsopt + transport' <<<"$d" ;;
+    trojan) jq -c "$SB_JQ"'
+      { type:"trojan", tag:"proxy", server:.server, server_port:(.port|tonumber), password:.password }
+      + tlsopt + transport' <<<"$d" ;;
+    shadowsocks) jq -c "$SB_JQ"'
+      { type:"shadowsocks", tag:"proxy", server:.server, server_port:(.port|tonumber),
+        method:.method, password:.password }' <<<"$d" ;;
+    hysteria2) jq -c "$SB_JQ"'
+      { type:"hysteria2", tag:"proxy", server:.server, server_port:(.port|tonumber), password:(.password|s) }
+      + ( if (.obfs|s)!="" then {obfs:{ type:(.obfs|s), password:(.obfsPassword|s) }} else {} end )
+      + ( if (.up|s)!=""   then {up_mbps:((.up|s)|gsub("[^0-9]";"")|if .=="" then 0 else tonumber end)}   else {} end )
+      + ( if (.down|s)!="" then {down_mbps:((.down|s)|gsub("[^0-9]";"")|if .=="" then 0 else tonumber end)} else {} end )
+      + ( if (.ports|s)!="" then {server_ports:((.ports|s)|split(",")|map(if test("-") then sub("-";":") else . + ":" + . end))} else {} end )
+      + { tls: ( { enabled:true, server_name:((.sni|s)|if .=="" then (.server|s) else . end) }
+                 + ( if ((.insecure|s)=="true" or (.insecure|s)=="1") then {insecure:true} else {} end )
+                 + ( if ((.alpn // [])|length) > 0 then {alpn:.alpn} else {} end ) ) }' <<<"$d" ;;
+    *) return 3 ;;
+  esac
+}
+
+# Build the active core's proxy outbound from a descriptor. Returns non-zero
+# (skip) when the active core can't run this node.
+build_proxy_outbound() {  # <descriptor> -> outbound JSON (tag proxy)
+  local d="$1" type obfs=0
+  type="$(jq -r '.type' <<<"$d")"
+  [ -n "$(jq -r '.obfs // ""' <<<"$d")" ] && obfs=1
+  core_supports "$type" "$obfs" || return 3
+  if [ "$CORE" = sing-box ]; then singbox_outbound "$d"; else xray_outbound "$d"; fi
 }
 
 # Flatten a Clash `proxies:` block into TAB-separated key/value records (\x1e between proxies).
@@ -1038,47 +1179,53 @@ do_import() {  # <url|file> <replace|append>
 
   ensure_nodes
   local nodes='[]'; [ "$mode" = append ] && nodes="$(cat "$NODES_FILE")"
-  local added=0 skipped=0 skips="" d nm typ ob
+  local added=0 skipped=0 skips="" d nm typ
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     nm="$(jq -r '.name // "node"' <<<"$d")"; typ="$(jq -r '.type' <<<"$d")"
     [ -n "$nm" ] || nm="$typ"
-    if ob="$(build_outbound "$d" 2>/dev/null)" && [ -n "$ob" ]; then
+    if build_proxy_outbound "$d" >/dev/null 2>&1; then
       nm="$(unique_name "$nm" "$nodes")"
-      nodes="$(jq -c --arg n "$nm" --argjson ob "$ob" '. + [{name:$n, outbound:$ob}]' <<<"$nodes")"
+      nodes="$(jq -c --arg n "$nm" --argjson d "$d" '. + [{name:$n, descriptor:$d}]' <<<"$nodes")"
       added=$((added+1))
     else
-      local why="Xray-core has no '$typ' outbound"
-      if [ "$typ" = hysteria2 ] && [ -n "$(jq -r '.obfs // ""' <<<"$d")" ]; then
-        why="hysteria2 with obfs — Xray-core has no Salamander obfs"
-      fi
       skipped=$((skipped+1)); skips="$skips
-    - $nm ($typ) — $why"
+    - $nm ($typ) — $(skip_reason "$d")"
     fi
   done <<< "$descs"
 
   printf '%s\n' "$nodes" > "$NODES_FILE"
-  ok "imported $added node(s) [$fmt, mode=$mode]"
+  ok "imported $added node(s) [$fmt, mode=$mode, core=$CORE]"
   if [ "$skipped" -gt 0 ]; then
-    warn "skipped $skipped node(s) Xray-core can't run:$skips"
+    warn "skipped $skipped node(s) the '$CORE' core can't run:$skips"
   fi
   reselect_active
   cmd_list
+}
+
+# Why the active core skips a descriptor — a helpful, fix-oriented one-liner.
+skip_reason() {  # <descriptor>
+  local d="$1" typ; typ="$(jq -r '.type' <<<"$d")"
+  if [ "$typ" = hysteria2 ] && [ -n "$(jq -r '.obfs // ""' <<<"$d")" ] && [ "$CORE" = xray ]; then
+    printf 'hysteria2 with obfs — Xray has no Salamander; run: xraycli core sing-box'
+  else
+    printf "the '%s' core has no '%s' outbound" "$CORE" "$typ"
+  fi
 }
 
 cmd_add() {
   local link="${1:-}"
   [ -n "$link" ] || die "usage: xraycli add '<share-link>'   (vless:// vmess:// trojan:// ss://)"
   need_jq
-  local d typ nm ob
+  local d typ nm
   d="$(parse_share_link "$link")" || die "unrecognised link scheme: ${link%%://*}"
   [ -n "$d" ] || die "could not parse the link"
   typ="$(jq -r '.type' <<<"$d")"; nm="$(jq -r '.name // "node"' <<<"$d")"; [ -n "$nm" ] || nm="$typ"
-  ob="$(build_outbound "$d" 2>/dev/null)" || die "Xray-core has no outbound for '$typ' — cannot add this node"
+  build_proxy_outbound "$d" >/dev/null 2>&1 || die "the '$CORE' core can't run '$typ' — $(skip_reason "$d")"
   ensure_nodes
   local nodes; nodes="$(jq -c --arg n "$nm" 'map(select(.name != $n))' "$NODES_FILE")"
   nm="$(unique_name "$nm" "$nodes")"
-  jq -c --arg n "$nm" --argjson ob "$ob" '. + [{name:$n, outbound:$ob}]' <<<"$nodes" > "$NODES_FILE"
+  jq -c --arg n "$nm" --argjson d "$d" '. + [{name:$n, descriptor:$d}]' <<<"$nodes" > "$NODES_FILE"
   ok "added node: $nm ($typ)"
   echo "  activate it with:  xraycli use '$nm'"
 }
@@ -1111,7 +1258,35 @@ cmd_update() {
 cmd_version() {
   load_env
   printf 'xraycli %s\n' "$XRAYCLI_VERSION_SELF"
-  printf 'xray    %s\n' "$(core_version)"
+  printf '%-7s %s\n' "$CORE" "$(core_version)"
+}
+
+# xraycli core [show | xray | sing-box]  — show or switch the proxy core.
+cmd_core() {
+  load_env
+  local sub="${1:-show}"
+  case "$sub" in
+    show|"") printf 'core: %s' "$CORE"
+             [ -x "$CORE_BIN" ] && printf ' (%s, %s)\n' "$(core_version)" "$CORE_BIN" || printf ' (binary missing: %s)\n' "$CORE_BIN" ;;
+    xray|sing-box|singbox)
+      local want="$sub"; [ "$want" = singbox ] && want="sing-box"
+      [ "$want" = "$CORE" ] && { ok "already using $want"; return 0; }
+      [ -x "$CORE_DIR/$want" ] || die "$want is not installed at $CORE_DIR/$want — install it: re-run install.sh --core $want"
+      # persist XRAYCLI_CORE in the env file (idempotent)
+      mkdir -p "$CONFIG_DIR"
+      if grep -q '^XRAYCLI_CORE=' "$ENV_FILE" 2>/dev/null; then
+        sed -i "s|^XRAYCLI_CORE=.*|XRAYCLI_CORE=\"$want\"|" "$ENV_FILE"
+      else
+        printf 'XRAYCLI_CORE="%s"\n' "$want" >> "$ENV_FILE"
+      fi
+      load_env                       # re-resolve CORE/CORE_BIN
+      cmd_regen                      # rebuild config for the new core
+      restart_if_running
+      ok "switched core to $CORE ($(core_version))"
+      echo "  re-run 'xraycli update' to re-evaluate nodes the previous core had skipped."
+      ;;
+    *) die "usage: xraycli core [show|xray|sing-box]" ;;
+  esac
 }
 
 remove_bashrc_block() {
@@ -1225,8 +1400,9 @@ ${c_bld}Nodes / subscription${c_rst}  ${c_dim}(auto-detects base64 & Clash; skip
 
 ${c_bld}Config${c_rst}
   port                  print the local proxy ports
+  core [show|xray|sing-box]   show / switch the proxy core (sing-box adds hy2+obfs)
   config [show|path|edit|regen]   view / edit / rebuild config.json
-  version               print xraycli + xray versions
+  version               print xraycli + core versions
 
 ${c_bld}App integration${c_rst}  ${c_dim}(point AI CLIs at this proxy's HTTP inbound)${c_rst}
   claude [on|off]       write/remove HTTP proxy in ~/.claude/settings.json
@@ -1244,6 +1420,7 @@ EOF
 #  Dispatch                                                                    #
 # --------------------------------------------------------------------------- #
 main() {
+  load_env               # resolve CORE / CORE_BIN before any command runs
   init_systemd_paths
   init_service_mode
   local cmd="${1:-help}"; shift || true
@@ -1267,6 +1444,7 @@ main() {
     current)          cmd_current "$@" ;;
     direct)           cmd_direct "$@" ;;
     port|ports)       cmd_port "$@" ;;
+    core)             cmd_core "$@" ;;
     config|conf)      cmd_config "$@" ;;
     claude|claude-code) cmd_claude "$@" ;;
     codex)            cmd_codex "$@" ;;

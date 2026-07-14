@@ -38,6 +38,7 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 readonly APP="xraycli"
 readonly XRAY_REPO="XTLS/Xray-core"
+readonly SINGBOX_REPO="SagerNet/sing-box"
 
 # This project's repo — used to fetch the control script when install.sh is run
 # piped (e.g. `bash <(curl -Ls .../install.sh)`) with no local checkout.
@@ -67,6 +68,9 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pw
 #  Defaults / CLI options                                                     #
 # --------------------------------------------------------------------------- #
 XRAY_VERSION="latest"
+CORE_KIND="xray"            # which proxy core to install: xray | sing-box
+CORE_EXPLICIT=0            # 1 → user passed --core, so don't prompt
+CORE_VERSION="latest"      # sing-box release tag (or 'latest')
 PREF_SOCKS_PORT=""          # empty → derive from $USER (see user_port_base)
 PREF_HTTP_PORT=""           # empty → derive from $USER (SOCKS base + 1)
 USER_PORT=1                 # 1 → ports are a deterministic function of $USER
@@ -110,7 +114,9 @@ Usage:
   bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh) [options]
 
 Options:
-  --version <vX.Y.Z>   Install a specific Xray-core version (default: latest)
+  --core <name>        Proxy core: xray (default) or sing-box. sing-box also runs
+                       hysteria2 + Salamander obfs.
+  --version <vX.Y.Z>   Install a specific core version (default: latest)
   --socks-port <n>     Preferred SOCKS port   (default: derived from $USER)
   --http-port  <n>     Preferred HTTP  port   (default: SOCKS base + 1)
   --no-user-port       Do not derive ports from $USER; scan from 10808/10809
@@ -130,7 +136,8 @@ EOF
 # --------------------------------------------------------------------------- #
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version)    XRAY_VERSION="${2:?}"; shift 2 ;;
+    --core)       CORE_KIND="${2:?}"; CORE_EXPLICIT=1; shift 2 ;;
+    --version)    XRAY_VERSION="${2:?}"; CORE_VERSION="${2:?}"; shift 2 ;;
     --socks-port) PREF_SOCKS_PORT="${2:?}"; shift 2 ;;
     --http-port)  PREF_HTTP_PORT="${2:?}"; shift 2 ;;
     --no-user-port) USER_PORT=0; shift ;;
@@ -144,6 +151,12 @@ while [ $# -gt 0 ]; do
     *) die "unknown option: $1 (try --help)" ;;
   esac
 done
+
+case "$CORE_KIND" in
+  xray) ;;
+  sing-box|singbox) CORE_KIND="sing-box" ;;
+  *) die "unknown --core '$CORE_KIND' (expected: xray or sing-box)" ;;
+esac
 
 # --------------------------------------------------------------------------- #
 #  Helpers                                                                     #
@@ -173,6 +186,13 @@ fetch_stdout() {  # fetch_stdout <url> -> stdout
   else return 1; fi
 }
 
+latest_tag() {  # <owner/repo> -> latest release tag (e.g. v1.13.14)
+  local repo="$1" tag
+  tag="$(fetch_stdout "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+         | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
+  [ -n "$tag" ] && printf '%s\n' "$tag"
+}
+
 # Install packages via whatever system package manager exists. Uses sudo only if
 # not root and sudo is available. Returns non-zero if it cannot install.
 pkg_install() {
@@ -195,7 +215,7 @@ ensure_deps() {
   info "Checking dependencies"
   local missing=()
   have curl || have wget || missing+=(curl)
-  have unzip || missing+=(unzip)
+  if [ "$CORE_KIND" = sing-box ]; then have tar || missing+=(tar); else have unzip || missing+=(unzip); fi
   have jq    || missing+=(jq)
   if [ "${#missing[@]}" -eq 0 ]; then ok "all dependencies present"; return 0; fi
 
@@ -208,7 +228,11 @@ ensure_deps() {
   fi
 
   have curl || have wget || die "curl or wget is required — please install one and re-run"
-  have unzip || die "unzip is required to extract Xray — please install it and re-run"
+  if [ "$CORE_KIND" = sing-box ]; then
+    have tar || die "tar is required to extract sing-box — please install it and re-run"
+  else
+    have unzip || die "unzip is required to extract Xray — please install it and re-run"
+  fi
   have jq    || warn "jq not installed: subscription/node commands will need it (install jq later)"
 }
 
@@ -272,6 +296,10 @@ preflight() {
 }
 
 install_core() {
+  if [ "$CORE_KIND" = sing-box ]; then install_core_singbox; else install_core_xray; fi
+}
+
+install_core_xray() {
   info "Detecting platform and resolving Xray-core release"
   local asset base url tmp
   asset="$(detect_asset)"
@@ -300,6 +328,53 @@ install_core() {
   local ver
   ver="$(XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_DIR/xray" version 2>/dev/null | head -1 || true)"
   ok "installed core: ${ver:-unknown}"
+}
+
+# echoes the sing-box arch token for this machine
+detect_singbox_arch() {
+  local arch; arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64)       echo amd64 ;;
+    i386|i686)          echo 386 ;;
+    aarch64|arm64)      echo arm64 ;;
+    armv7l|armv7|armhf) echo armv7 ;;
+    armv6l)             echo armv6 ;;
+    s390x)              echo s390x ;;
+    ppc64le)            echo ppc64le ;;
+    riscv64)            echo riscv64 ;;
+    loongarch64|loong64) echo loong64 ;;
+    *) die "unsupported CPU architecture for sing-box: $arch" ;;
+  esac
+}
+
+install_core_singbox() {
+  [ "$(uname -s)" = Linux ] || die "sing-box auto-install here supports Linux only"
+  have tar || die "tar is required to extract sing-box — please install it and re-run"
+  info "Resolving sing-box release"
+  local arch ver tag num url tmp
+  arch="$(detect_singbox_arch)"
+  if [ "$CORE_VERSION" = latest ]; then
+    tag="$(latest_tag "$SINGBOX_REPO")" || die "could not resolve latest sing-box version"
+  else
+    tag="$CORE_VERSION"
+  fi
+  num="${tag#v}"
+  url="${MIRROR}https://github.com/$SINGBOX_REPO/releases/download/${tag}/sing-box-${num}-linux-${arch}.tar.gz"
+  ok "asset: sing-box-${num}-linux-${arch}.tar.gz  (version: $tag)"
+
+  TMP_DIR="$(mktemp -d)"; tmp="$TMP_DIR"
+  info "Downloading $url"
+  download "$url" "$tmp/sb.tgz" || die "download failed"
+
+  info "Extracting core"
+  tar -xzf "$tmp/sb.tgz" -C "$tmp" || die "tar extract failed"
+  local bin; bin="$(find "$tmp" -type f -name sing-box | head -1)"
+  [ -n "$bin" ] || die "archive did not contain the sing-box binary"
+
+  mkdir -p "$CORE_DIR"
+  install -m 0755 "$bin" "$CORE_DIR/sing-box"
+  local v; v="$("$CORE_DIR/sing-box" version 2>/dev/null | head -1 || true)"
+  ok "installed core: ${v:-unknown}"
 }
 
 port_user() {  # the identity we hash: $USER, with sane fallbacks
@@ -338,10 +413,15 @@ write_env() {
   info "Writing environment file"
   mkdir -p "$CONFIG_DIR" "$STATE_DIR"
   local ver
-  ver="$(XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_DIR/xray" version 2>/dev/null | head -1 | awk '{print $2}' || true)"
+  if [ "$CORE_KIND" = sing-box ]; then
+    ver="$("$CORE_DIR/sing-box" version 2>/dev/null | head -1 | awk '{print $3}' || true)"
+  else
+    ver="$(XRAY_LOCATION_ASSET="$CORE_DIR" "$CORE_DIR/xray" version 2>/dev/null | head -1 | awk '{print $2}' || true)"
+  fi
   cat > "$ENV_FILE" <<EOF
 # Managed by xraycli install.sh — safe to edit ports/listen, then run: xraycli config regen
-XRAYCLI_VERSION="${ver:-$XRAY_VERSION}"
+XRAYCLI_VERSION="${ver:-latest}"
+XRAYCLI_CORE="$CORE_KIND"
 XRAYCLI_LISTEN="$LISTEN_ADDR"
 XRAYCLI_SOCKS_PORT="$SOCKS_PORT"
 XRAYCLI_HTTP_PORT="$HTTP_PORT"
@@ -413,7 +493,7 @@ summary() {
   printf '%s%s installed successfully.%s\n' "$c_bld" "$APP" "$c_rst"
   echo
   echo "  Control script : $BIN_DIR/xraycli"
-  echo "  Xray core      : $CORE_DIR/xray"
+  echo "  Proxy core     : $CORE_KIND  ($CORE_DIR/$CORE_KIND)"
   echo "  Config         : $CONFIG_DIR/config.json"
   echo "  Logs           : $STATE_DIR/{access,error}.log"
   echo "  SOCKS proxy    : $LISTEN_ADDR:$socks"
@@ -441,6 +521,20 @@ ask() {  # ask <prompt> <default:y|n>
   read -rp "$prompt $hint " ans || true
   ans="${ans:-$def}"
   case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+# Pick the proxy core interactively, before anything is downloaded. Skipped when
+# --core was given, when the wizard is off, or in a non-interactive session
+# (piped installs default to xray).
+choose_core() {
+  { [ "$DO_WIZARD" -eq 1 ] && [ "$CORE_EXPLICIT" -eq 0 ] && [ -t 0 ]; } || return 0
+  echo
+  printf '%s— proxy core —%s  which core should run the tunnel?\n' "$c_bld" "$c_rst"
+  printf '  1) xray      %s(default) VLESS/REALITY, VMess, Trojan, Shadowsocks, hysteria2 (no obfs)%s\n' "$c_dim" "$c_rst"
+  printf '  2) sing-box  %sall of the above + hysteria2 with Salamander obfs%s\n' "$c_dim" "$c_rst"
+  local ans; read -rp "  choose [1/2] (default 1): " ans || true
+  case "${ans:-1}" in 2|sing-box|singbox|s) CORE_KIND="sing-box" ;; *) CORE_KIND="xray" ;; esac
+  ok "core: $CORE_KIND"
 }
 
 run_wizard() {
@@ -490,6 +584,7 @@ run_wizard() {
 # --------------------------------------------------------------------------- #
 main() {
   printf '%s%s installer%s\n\n' "$c_bld" "$APP" "$c_rst"
+  choose_core
   preflight
   install_core
   choose_ports

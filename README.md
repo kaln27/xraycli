@@ -17,6 +17,9 @@ xraycli     →  start / stop / restart / status / enable / logs / nodes / unins
 
 ## Highlights
 
+- **Pick your core — Xray or sing-box.** Choose at install (`--core` or the
+  wizard). Xray is the default; **sing-box** additionally runs **hysteria2 with
+  Salamander obfs**. Switch anytime with `xraycli core sing-box`.
 - **User scope only.** Binaries in `~/.local/share`, config in `~/.config`,
   logs in `~/.local/state`, a `--user` systemd unit, and the `xraycli` command
   in `~/.local/bin`. Nothing goes to `/etc`, `/usr`, or any system unit.
@@ -54,10 +57,12 @@ straight through, e.g. `… /install.sh) --no-service`.
 > Prefer `bash <(curl …)` over `curl … | bash` — it keeps your terminal on
 > stdin, so confirmation prompts still work.
 
-When run interactively, the installer finishes with a short **setup wizard** that
-offers to (1) import a subscription, (2) start the proxy and enable boot
+When run interactively, the installer first asks **which core** to install
+(Xray or sing-box; default Xray), then at the end runs a short **setup wizard**
+that offers to (1) import a subscription, (2) start the proxy and enable boot
 auto-start, and (3) route Claude Code / Codex through it. Every step is optional
-and repeatable later; skip the whole thing with `--no-wizard`.
+and repeatable later; skip the wizard (and the core prompt) with `--no-wizard`,
+or preselect the core with `--core sing-box`.
 
 ### From a checkout
 
@@ -77,7 +82,8 @@ source ~/.bashrc
 
 | Option | Meaning |
 | --- | --- |
-| `--version vX.Y.Z` | Pin a specific Xray-core version (default: latest) |
+| `--core NAME` | Proxy core: `xray` (default) or `sing-box` (adds hy2 + Salamander obfs) |
+| `--version vX.Y.Z` | Pin a specific core version (default: latest) |
 | `--socks-port N` | Preferred SOCKS port (default: derived from `$USER`) |
 | `--http-port N` | Preferred HTTP port (default: SOCKS base + 1) |
 | `--no-user-port` | Don't derive ports from `$USER`; scan from `10808`/`10809` |
@@ -113,6 +119,7 @@ Nodes / subscription
 
 Config
   xraycli port                    # print local proxy ports
+  xraycli core [show|xray|sing-box]   # show / switch the proxy core
   xraycli config [show|path|edit|regen]
   xraycli version
 
@@ -255,26 +262,30 @@ per fetch are picked up automatically); otherwise it selects the first node.
 
 ### Supported node protocols
 
-Xray-core runs **VLESS** (incl. REALITY + XTLS-Vision), **VMess**, **Trojan**,
-and **Shadowsocks**, over `tcp` / `ws` / `grpc` / `h2` with `tls` / `reality`,
-plus **Hysteria2** (`hysteria2://` / `hy2://` links and Clash `type: hysteria2`,
-including port-hopping via `ports`).
+Both cores run **VLESS** (incl. REALITY + XTLS-Vision), **VMess**, **Trojan**,
+**Shadowsocks**, over `tcp` / `ws` / `grpc` with `tls` / `reality`, plus
+**Hysteria2** (`hysteria2://` / `hy2://` links and Clash `type: hysteria2`, incl.
+port-hopping). The difference is **obfs** and a few extra protocols:
 
-> **Hysteria2 caveat — Salamander obfs.** Xray-core supports Hysteria2 but has
-> **no Salamander obfs** ([XTLS/Xray-core#5712](https://github.com/XTLS/Xray-core/issues/5712),
-> closed as *not planned*). A node with `obfs: salamander` would produce a config
-> that loads yet silently fails to connect, so xraycli **skips** obfs'd hysteria2
-> nodes with a clear reason. Hysteria2 nodes **without** obfs import and run.
-> (Also note: Xray 26.x removed blanket `allowInsecure`/`skip-cert-verify`, so
-> that flag is dropped — the server needs a cert valid for its SNI.)
+| Node | Xray | sing-box |
+| --- | --- | --- |
+| VLESS / VMess / Trojan / Shadowsocks | ✅ | ✅ |
+| Hysteria2 (no obfs) | ✅ | ✅ |
+| **Hysteria2 + Salamander obfs** | ❌ skipped | ✅ |
 
-Protocols Xray-core genuinely has **no outbound for** — `tuic`, `wireguard`,
-`ssr`, `snell`, `hysteria` (v1), … — are recognised and **skipped** on import
-with a clear report (and refused by `add`), rather than silently breaking the
-config. You'll see `skipped N node(s) Xray-core can't run: …` naming each.
+> **Why obfs needs sing-box.** Xray-core has **no Salamander obfs**
+> ([XTLS/Xray-core#5712](https://github.com/XTLS/Xray-core/issues/5712), *not planned*):
+> such a node would load but silently fail, so under Xray it is **skipped** with a
+> reason pointing you to `xraycli core sing-box`. sing-box runs it natively.
+> (Xray 26.x also removed blanket `skip-cert-verify`; sing-box keeps `tls.insecure`.)
 
-Each stored node has the shape `{ "name": …, "outbound": { …Xray outbound… } }`
-in `~/.config/xraycli/nodes.json`.
+Import **auto-detects** which node types the active core can run and **skips** the
+rest with a clear report (`skipped N node(s) the '<core>' core can't run: …`).
+Switching core and re-running `xraycli update` re-evaluates previously-skipped nodes.
+
+Each stored node is `{ "name": …, "descriptor": { …neutral node fields… } }` in
+`~/.config/xraycli/nodes.json`; the active core compiles the descriptor to its own
+config on `use`/`regen`.
 
 ---
 
