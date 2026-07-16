@@ -54,11 +54,11 @@ Xray-core for your CPU, fetches the `xraycli` control script, picks free ports,
 and sets up the user service. No `git clone` needed. Pass installer options
 straight through, e.g. `… /install.sh) --no-service`.
 
-**Behind the GreatFirewall / flaky GitHub?** The installer probes GitHub first
-and, only if it looks unreachable, routes every download through the
-[gh-proxy.org](https://gh-proxy.org) mirror automatically — so you don't have to
-do anything. If GitHub is blocked so hard that even `install.sh` won't load,
-fetch the script itself through the mirror too:
+**Behind the GreatFirewall / flaky GitHub?** The installer asks whether to route
+every download (proxy core + control script) through the
+[gh-proxy.org](https://gh-proxy.org) mirror — answer yes if GitHub is slow or
+blocked on your network. If GitHub is blocked so hard that even `install.sh`
+won't load, fetch the script itself through the mirror too:
 
 ```bash
 bash <(curl -Ls https://gh-proxy.org/https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh)

@@ -85,7 +85,7 @@ DO_WIZARD=1                 # 1 → run the interactive setup wizard at the end
 # GitHub download routing. MIRROR is the effective prefix prepended to every
 # github.com/raw.githubusercontent.com URL ("" = fetch directly). When flaky
 # networks block GitHub, resolve_mirror() fills it with GH_PROXY_DEFAULT.
-#   GH_PROXY_MODE: auto = probe GitHub, mirror only if unreachable
+#   GH_PROXY_MODE: auto = ask (interactive) / direct (piped, no TTY)
 #                  on   = always mirror   ·   off = always direct
 readonly GH_PROXY_DEFAULT="https://gh-proxy.org/"
 GH_PROXY_MODE="auto"
@@ -140,9 +140,9 @@ Options:
   --mirror <prefix>    Use a custom mirror prefix instead of gh-proxy.org
   -h, --help           Show this help
 
-By default GitHub reachability is probed first; the mirror engages only when
-GitHub looks unreachable. Behind a firewall you can also fetch install.sh itself
-through the mirror:
+Without a proxy flag the installer asks whether to use the mirror (interactive
+only; piped/non-interactive installs default to direct). Behind a firewall you
+can also fetch install.sh itself through the mirror:
   bash <(curl -Ls https://gh-proxy.org/https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh)
 EOF
   exit "${1:-0}"
@@ -205,34 +205,30 @@ fetch_stdout() {  # fetch_stdout <url> -> stdout
   else return 1; fi
 }
 
-# Can we reach GitHub directly? A cheap 1-byte GET of a raw file with a short
-# cap. raw.githubusercontent.com is the right probe: releases sit behind a CDN
-# that can resolve even when raw/api are blocked, and it's raw + api that the
-# install actually stalls on.
-github_reachable() {
-  local u="https://raw.githubusercontent.com/$REPO_SLUG/$REPO_BRANCH/install.sh"
-  if   have curl; then curl -fsS --max-time 6 -r 0-0 -o /dev/null "$u" 2>/dev/null
-  elif have wget; then wget -q --timeout=6 --tries=1 -O /dev/null "$u" 2>/dev/null
-  else return 0; fi   # no fetcher yet → don't force a mirror; download() will die later
-}
-
 # Decide the effective $MIRROR prefix for all GitHub downloads. Runs once, after
-# ensure_deps (so curl/wget exist), before install_core.
+# ensure_deps, before anything is downloaded. With no --gh-proxy/--no-gh-proxy/
+# --mirror flag it asks (interactive only); non-interactive defaults to direct.
 resolve_mirror() {
   if [ -n "$MIRROR" ]; then info "using custom mirror: $MIRROR"; return; fi
   case "$GH_PROXY_MODE" in
     off) return ;;                                                    # forced direct
-    on)  MIRROR="$GH_PROXY_DEFAULT"; info "GitHub proxy forced on: $MIRROR" ;;
-    auto)
-      info "Probing GitHub reachability"
-      if github_reachable; then
-        ok "GitHub reachable — downloading directly"
-      else
-        MIRROR="$GH_PROXY_DEFAULT"
-        warn "GitHub looks unreachable — routing downloads via $MIRROR"
-        warn "(force direct: --no-gh-proxy   ·   custom mirror: --mirror <prefix>)"
-      fi ;;
+    on)  MIRROR="$GH_PROXY_DEFAULT"; info "GitHub proxy forced on: $MIRROR"; return ;;
   esac
+  # auto: ask, before any download. Piped/CI (no TTY) or --no-wizard → direct.
+  if [ "$DO_WIZARD" -ne 1 ] || [ ! -t 0 ]; then
+    info "downloading directly from GitHub (use --gh-proxy to route via $GH_PROXY_DEFAULT)"
+    return
+  fi
+  echo
+  printf '%sGitHub download source%s\n' "$c_bld" "$c_rst"
+  printf '  Downloads (proxy core + control script) come from GitHub. If GitHub is\n'
+  printf '  slow or blocked on your network, route them through the %sgh-proxy.org%s\n' "$c_dim" "$c_rst"
+  printf '  mirror (this trusts the mirror operator with your download traffic).\n'
+  if ask "  Use the GitHub proxy for downloads?" n; then
+    MIRROR="$GH_PROXY_DEFAULT"; ok "using GitHub proxy: $MIRROR"
+  else
+    ok "downloading directly from GitHub"
+  fi
 }
 
 latest_tag() {  # <owner/repo> -> latest release tag (e.g. v1.13.14)

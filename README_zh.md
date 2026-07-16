@@ -45,8 +45,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh
 按 CPU 架构下载对应的 Xray-core，拉取 `xraycli` 控制脚本，挑选空闲端口，并配置好用户级服务。
 **不需要 `git clone`**。安装参数可直接追加，例如 `… /install.sh) --no-service`。
 
-**访问 GitHub 不稳定？** 安装脚本会先探测 GitHub 是否可达，只有在不可达时才自动把所有下载
-经 [gh-proxy.org](https://gh-proxy.org) 镜像走一遍——你什么都不用做。如果 GitHub 被墙到
+**访问 GitHub 不稳定？** 安装时脚本会**询问**是否把所有下载（代理内核 + 控制脚本）经
+[gh-proxy.org](https://gh-proxy.org) 镜像走——GitHub 慢或被墙就选是。如果 GitHub 被墙到
 连 `install.sh` 本身都拉不下来，把脚本本体也经镜像获取即可：
 
 ```bash
