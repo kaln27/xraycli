@@ -59,8 +59,8 @@ straight through, e.g. `… /install.sh) --no-service`.
 
 When run interactively, the installer first asks **which core** to install
 (Xray or sing-box; default Xray), then at the end runs a short **setup wizard**
-that offers to (1) import a subscription, (2) start the proxy and enable boot
-auto-start, and (3) route Claude Code / Codex through it. Every step is optional
+that offers to (1) import one or more subscriptions, (2) start the proxy and
+enable boot auto-start, and (3) route Claude Code / Codex through it. Every step is optional
 and repeatable later; skip the wizard (and the core prompt) with `--no-wizard`,
 or preselect the core with `--core sing-box`.
 
@@ -108,10 +108,13 @@ Lifecycle
 
 Nodes / subscription
   xraycli add '<share-link>'      # add a node from a share link   (import: see below)
-  xraycli sub set '<url>'         # save a subscription URL
-  xraycli sub show | clear
-  xraycli update                  # fetch + parse the subscription (import: see below)
-  xraycli list                    # list saved nodes ('*' = active)
+  xraycli sub add '<url>'         # subscribe + import its nodes (repeatable)
+  xraycli sub list                # subscriptions with their node counts
+  xraycli sub rm <#|url>          # unsubscribe + drop that subscription's nodes
+  xraycli sub set '<url>'         # make this the only subscription
+  xraycli sub clear               # forget every subscription (keeps the nodes)
+  xraycli update                  # re-fetch every subscription, rebuild the list
+  xraycli list                    # list saved nodes ('●' = active)
   xraycli use <index|name>        # select the active node
   xraycli remove <index|name>
   xraycli current
@@ -248,17 +251,32 @@ For the `proxy-providers` case, xraycli reads each provider's own `url:` (not th
 providers are all expanded and combined.
 
 ```bash
-xraycli sub set 'https://example.com/sub/xxxx'   # save your subscription URL
-xraycli update                                    # fetch + rebuild the node list
-# or one-off, without saving:
+xraycli sub add 'https://example.com/sub/xxxx'   # subscribe + import its nodes
+xraycli sub add 'https://other.com/clash/yyyy'   # repeat for as many as you like
+xraycli sub list                                  # see them, numbered, with node counts
+xraycli update                                    # re-fetch them all, rebuild the list
+# or one-off, without subscribing:
 xraycli import 'https://example.com/clash/xxxx'
 xraycli import ./my-nodes.txt                      # also works on a local file
 xraycli add 'vless://…#my-node'                    # add a single share link
 ```
 
-`update` replaces the node list from the subscription and keeps your previously
-active node selected if it still exists (REALITY `shortId`/`spiderX` that rotate
-per fetch are picked up automatically); otherwise it selects the first node.
+### Multiple subscriptions
+
+`sub add` is repeatable — every subscription's nodes live in one list, and a
+single `xraycli update` re-fetches all of them. When more than one is in play,
+`list` grows a `SUB` column with each node's subscription number from
+`sub list`. Names that collide across subscriptions get a `#2` suffix.
+
+`update` rebuilds every subscription's nodes and keeps your previously active
+node selected if it still exists (REALITY `shortId`/`spiderX` that rotate per
+fetch are picked up automatically); otherwise it selects the first node. A
+subscription that fails to fetch is reported and skipped — the others still
+update.
+
+Nodes you added by hand with `xraycli add` are never touched by `update`,
+`import` or `sub set`. `sub rm <#>` drops a subscription along with exactly the
+nodes that came from it; `sub clear` forgets the URLs but leaves the nodes.
 
 ### Supported node protocols
 

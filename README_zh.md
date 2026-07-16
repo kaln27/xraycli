@@ -48,7 +48,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh
 > 建议用 `bash <(curl …)` 而不是 `curl … | bash`：前者会保留终端 stdin，交互确认才能正常工作。
 
 在交互式运行时，安装脚本会**先问用哪个内核**（Xray 或 sing-box，默认 Xray），最后再进入一个
-简短的**设置向导**，依次引导你：(1) 导入订阅，(2) 启动代理并设为开机自启，(3) 把 Claude Code /
+简短的**设置向导**，依次引导你：(1) 导入订阅（可以连续加多个），(2) 启动代理并设为开机自启，(3) 把 Claude Code /
 Codex 接到代理上。每一步都是可选的、以后也能单独再来一遍；想跳过向导（和选内核那步）就加
 `--no-wizard`，或用 `--core sing-box` 预先指定内核。
 
@@ -93,9 +93,9 @@ source ~/.bashrc
 支持两种订阅格式，**根据内容自动识别**（不看链接后缀）：base64（传统分享链接列表）与 Clash（YAML）。
 
 ```bash
-# 保存订阅地址，然后拉取 / 更新节点列表
-xraycli sub set 'https://你的机场/clash/xxxxxx'
-xraycli update
+# 订阅并导入节点；可以重复添加多个订阅
+xraycli sub add 'https://你的机场/clash/xxxxxx'
+xraycli sub add 'https://另一个机场/sub/yyyyyy'
 ```
 
 输出示例：
@@ -125,12 +125,27 @@ xraycli import ./my-nodes.txt                   # 本地文件
 xraycli add 'vless://…#香港-01'
 ```
 
-以后想更新节点，只要再跑一次（会自动保留当前选中的节点；REALITY 每次刷新变化的
-`shortId`/`spiderX` 也会自动跟着更新）：
+以后想更新节点，只要再跑一次 `update` —— 它会把**所有**订阅重新拉一遍（自动保留当
+前选中的节点；REALITY 每次刷新变化的 `shortId`/`spiderX` 也会跟着更新）：
 
 ```bash
 xraycli update
 ```
+
+### 多个订阅
+
+`sub add` 可以重复执行，多个机场的节点会汇总到同一个列表里，一条 `xraycli update`
+全部刷新。订阅超过一个时，`list` 会多出一列 `SUB`，标明每个节点来自 `sub list` 里
+的第几个订阅；不同订阅之间的重名节点会自动加 `#2` 后缀。
+
+```bash
+xraycli sub list           # 列出订阅（带编号和各自的节点数）
+xraycli sub rm 2           # 退订第 2 个，并删掉来自它的节点
+xraycli sub clear          # 只忘掉所有订阅地址，节点保留
+```
+
+某个订阅拉取失败时会单独告警并跳过，不影响其它订阅更新。用 `xraycli add` 手工添加
+的节点属于你自己，`update` / `import` / `sub set` 都不会动它们。
 
 ### 2. 查看节点
 
@@ -263,11 +278,14 @@ HTTPS_PROXY=http://127.0.0.1:10809
 
 节点 / 订阅       （自动识别 base64 与 Clash；跳过 Xray 不支持的协议）
   xraycli add '<分享链接>'    # 添加单个节点（vless:// vmess:// trojan:// ss://）
-  xraycli sub set '<url>'     # 保存订阅地址
-  xraycli sub show | clear    # 查看 / 清除订阅地址
-  xraycli update              # 拉取已保存的订阅并重建节点列表
-  xraycli import <url|文件>   # 临时导入（不保存）
-  xraycli list                # 列出节点（'*' 为当前）
+  xraycli sub add '<url>'     # 订阅并导入节点（可重复添加多个）
+  xraycli sub list            # 列出订阅（带编号和节点数）
+  xraycli sub rm <序号|url>   # 退订，并删掉来自它的节点
+  xraycli sub set '<url>'     # 只保留这一个订阅（替换其它）
+  xraycli sub clear           # 忘掉所有订阅地址（节点保留）
+  xraycli update              # 重新拉取所有订阅并重建节点列表
+  xraycli import [--append] <url|文件>   # 临时导入（不保存订阅）
+  xraycli list                # 列出节点（'●' 为当前）
   xraycli use <序号|名字>     # 选择当前节点
   xraycli remove <序号|名字>  # 删除节点
   xraycli current             # 打印当前节点

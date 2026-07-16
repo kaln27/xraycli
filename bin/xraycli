@@ -357,7 +357,7 @@ EOF
 # --------------------------------------------------------------------------- #
 #  Node selection helpers                                                     #
 # --------------------------------------------------------------------------- #
-ensure_nodes() { [ -f "$NODES_FILE" ] || echo '[]' > "$NODES_FILE"; }
+ensure_nodes() { mkdir -p "$CONFIG_DIR"; [ -f "$NODES_FILE" ] || echo '[]' > "$NODES_FILE"; }
 
 current_name() { [ -f "$ACTIVE_NAME_FILE" ] && cat "$ACTIVE_NAME_FILE" || echo ""; }
 
@@ -573,15 +573,23 @@ cmd_list() {
   if [ "$n" -eq 0 ]; then
     printf '  no nodes yet.\n'
     printf '    add one   : %sxraycli add '\''<share-link>'\''%s\n' "$c_dim" "$c_rst"
-    printf '    or import : %sxraycli sub set '\''<url>'\'' && xraycli update%s\n' "$c_dim" "$c_rst"
+    printf '    or import : %sxraycli sub add '\''<url>'\''%s\n' "$c_dim" "$c_rst"
     return 0
   fi
   local cur; cur="$(current_name)"
 
-  # One TSV row per node: idx, active(1/0), name, proto, server:port, net/sec.
+  # A SUB column only earns its width once more than one subscription feeds the
+  # list; until then every node has the same origin and the number says nothing.
+  local subs_json='[]' show_sub=0
+  if [ "$(sub_count)" -gt 1 ]; then
+    show_sub=1
+    subs_json="$(sub_urls | jq -R -s 'split("\n") | map(select(length > 0))')"
+  fi
+
+  # One TSV row per node: idx, active(1/0), name, proto, server:port, net/sec, sub.
   # Reads the node's descriptor; falls back to a legacy prebuilt .outbound.
   local rows
-  rows="$(jq -r --arg cur "$cur" '
+  rows="$(jq -r --arg cur "$cur" --argjson subs "$subs_json" '
     def proto:
       ( if .descriptor then .descriptor.type
         else (.outbound.protocol // "?") end )
@@ -595,32 +603,44 @@ cmd_list() {
         ( if .descriptor.type=="hysteria2" then "quic/tls"
           else "\(.descriptor.network // "tcp")/\(.descriptor.security // "none")" end )
       else "\(.outbound.streamSettings.network // "tcp")/\(.outbound.streamSettings.security // "none")" end;
+    def sub:
+      (.source // "") as $s
+      | ($subs | index($s)) | if . then (. + 1 | tostring) else "-" end;
     to_entries[]
     | [ (.key|tostring),
         (if .value.name == $cur then "1" else "0" end),
         .value.name,
         (.value|proto),
         (.value|ep),
-        (.value|ns) ] | @tsv
+        (.value|ns),
+        (.value|sub) ] | @tsv
   ' "$NODES_FILE")"
 
   # size each column to its widest cell (header labels set the minimums)
-  local wN=4 wP=5 wS=6 idx act name proto ep ns
-  while IFS=$'\t' read -r idx act name proto ep ns; do
+  local wN=4 wP=5 wS=6 idx act name proto ep ns sub
+  while IFS=$'\t' read -r idx act name proto ep ns sub; do
     [ "${#name}"  -gt "$wN" ] && wN="${#name}"
     [ "${#proto}" -gt "$wP" ] && wP="${#proto}"
     [ "${#ep}"    -gt "$wS" ] && wS="${#ep}"
   done <<< "$rows"
 
-  printf '%s  %s %-2s %-*s  %-*s  %-*s  %s%s\n' \
-    "$c_dim" " " "#" "$wN" "NAME" "$wP" "PROTO" "$wS" "SERVER" "NET/SEC" "$c_rst"
+  local subcell=""
+  [ "$show_sub" = 1 ] && subcell="$(printf '%-4s' "SUB")"
+  printf '%s  %s %-2s %s%-*s  %-*s  %-*s  %s%s\n' \
+    "$c_dim" " " "#" "$subcell" "$wN" "NAME" "$wP" "PROTO" "$wS" "SERVER" "NET/SEC" "$c_rst"
   local mark col
-  while IFS=$'\t' read -r idx act name proto ep ns; do
+  while IFS=$'\t' read -r idx act name proto ep ns sub; do
     if [ "$act" = 1 ]; then mark="${c_grn}●${c_rst}"; col="$c_grn"; else mark=' '; col=""; fi
-    printf '  %s %-2s %s%-*s%s  %-*s  %-*s  %s%s%s\n' \
-      "$mark" "$idx" "$col" "$wN" "$name" "$c_rst" "$wP" "$proto" "$wS" "$ep" "$c_dim" "$ns" "$c_rst"
+    subcell=""
+    [ "$show_sub" = 1 ] && subcell="$(printf '%s%-4s%s' "$c_dim" "$sub" "$c_rst")"
+    printf '  %s %-2s %s%s%-*s%s  %-*s  %-*s  %s%s%s\n' \
+      "$mark" "$idx" "$subcell" "$col" "$wN" "$name" "$c_rst" "$wP" "$proto" "$wS" "$ep" "$c_dim" "$ns" "$c_rst"
   done <<< "$rows"
-  printf '%s  ● active  ·  switch: xraycli use <#|name>%s\n' "$c_dim" "$c_rst"
+  if [ "$show_sub" = 1 ]; then
+    printf '%s  ● active  ·  SUB = xraycli sub list  ·  switch: xraycli use <#|name>%s\n' "$c_dim" "$c_rst"
+  else
+    printf '%s  ● active  ·  switch: xraycli use <#|name>%s\n' "$c_dim" "$c_rst"
+  fi
 }
 
 cmd_current() {
@@ -1144,6 +1164,9 @@ descriptors_from_content() {  # <file> [depth] -> descriptors on stdout
 
 unique_name() {  # <base> <nodes-json> -> a name not present in nodes
   local base="$1" arr="$2" n="$1" i=1
+  # An empty arr would make `jq -e` exit 0 (the filter never runs), and this
+  # loop would spin forever chasing a collision that isn't there.
+  [ -n "$arr" ] || arr='[]'
   while jq -e --arg n "$n" 'any(.[]?; .name==$n)' <<<"$arr" >/dev/null 2>&1; do
     i=$((i+1)); n="$base #$i"
   done
@@ -1164,41 +1187,78 @@ reselect_active() {  # keep the active node if it still exists, else pick the fi
   fi
 }
 
-do_import() {  # <url|file> <replace|append>
-  need_jq
-  local src="$1" mode="${2:-replace}" tmp fmt descs
+# Fetch one source and print its descriptors, one JSON object per line.
+# Progress noise goes to stderr — stdout is data. Returns non-zero (without
+# killing the run) so a bad URL can't sink an update of the others.
+fetch_descriptors() {  # <url|file>
+  local src="$1" tmp fmt descs
   tmp="$(mktemp)"
-  fetch_url "$src" > "$tmp" 2>/dev/null || { rm -f "$tmp"; die "failed to fetch: $src"; }
-  [ -s "$tmp" ] || { rm -f "$tmp"; die "empty response from: $src"; }
+  if ! fetch_url "$src" > "$tmp" 2>/dev/null || [ ! -s "$tmp" ]; then
+    rm -f "$tmp"; warn "fetch failed or empty response: $src"; return 1
+  fi
   fmt="$(detect_format "$tmp")"
-  [ "$fmt" = unknown ] && { rm -f "$tmp"; die "unrecognised subscription format (expected Clash YAML or base64/raw links)"; }
-  info "detected subscription format: $fmt"
-  descs="$(descriptors_from_content "$tmp" 0)"     # parses proxies + proxy-providers
+  if [ "$fmt" = unknown ]; then
+    rm -f "$tmp"; warn "unrecognised format (want Clash YAML or base64/raw links): $src"; return 1
+  fi
+  info "$src [$fmt]" >&2
+  descs="$(descriptors_from_content "$tmp" 0)"    # inline proxies + proxy-providers
   rm -f "$tmp"
-  [ -n "$descs" ] || die "no nodes found in the subscription"
+  [ -n "$descs" ] || { warn "no nodes found in: $src"; return 1; }
+  printf '%s' "$descs"
+}
 
-  ensure_nodes
-  local nodes='[]'; [ "$mode" = append ] && nodes="$(cat "$NODES_FILE")"
-  local added=0 skipped=0 skips="" d nm typ
+# Merge one source's descriptors into a nodes array. Callers run this in a
+# command substitution, so tallies can't ride back on globals — the whole result
+# comes out as one JSON envelope: {nodes, added, skipped, skips}.
+merge_descriptors() {  # <nodes-json> <source-tag> <descriptors>
+  local nodes="$1" srctag="$2" descs="$3" d nm typ added=0 skipped=0 skips=""
   while IFS= read -r d; do
     [ -n "$d" ] || continue
     nm="$(jq -r '.name // "node"' <<<"$d")"; typ="$(jq -r '.type' <<<"$d")"
     [ -n "$nm" ] || nm="$typ"
     if build_proxy_outbound "$d" >/dev/null 2>&1; then
       nm="$(unique_name "$nm" "$nodes")"
-      nodes="$(jq -c --arg n "$nm" --argjson d "$d" '. + [{name:$n, descriptor:$d}]' <<<"$nodes")"
+      nodes="$(jq -c --arg n "$nm" --arg s "$srctag" --argjson d "$d" \
+        '. + [{name:$n, source:$s, descriptor:$d}]' <<<"$nodes")"
       added=$((added+1))
     else
       skipped=$((skipped+1)); skips="$skips
     - $nm ($typ) — $(skip_reason "$d")"
     fi
   done <<< "$descs"
+  jq -cn --argjson nodes "$nodes" --argjson added "$added" \
+         --argjson skipped "$skipped" --arg skips "$skips" \
+    '{nodes:$nodes, added:$added, skipped:$skipped, skips:$skips}'
+}
+
+# Fetch every source, merge onto <base-nodes>, save, and show the result.
+# Sources that fail are warned about and skipped; returns non-zero (leaving
+# NODES_FILE untouched) only when not a single one came through.
+import_write() {  # <base-nodes-json> <src>...
+  need_jq; ensure_nodes
+  local nodes="$1"; shift
+  [ -n "$nodes" ] || nodes='[]'
+  local src descs res got=0 srcs=0 added=0 skipped=0 skips=""
+  for src in "$@"; do
+    srcs=$((srcs+1))
+    descs="$(fetch_descriptors "$src")" || continue
+    res="$(merge_descriptors "$nodes" "$src" "$descs")"
+    nodes="$(jq -c '.nodes' <<<"$res")"
+    added=$((added + $(jq -r '.added' <<<"$res")))
+    skipped=$((skipped + $(jq -r '.skipped' <<<"$res")))
+    skips="$skips$(jq -r '.skips' <<<"$res")"
+    got=$((got+1))
+  done
+  [ "$got" -gt 0 ] || return 1
 
   printf '%s\n' "$nodes" > "$NODES_FILE"
-  ok "imported $added node(s) [$fmt, mode=$mode, core=$CORE]"
-  if [ "$skipped" -gt 0 ]; then
-    warn "skipped $skipped node(s) the '$CORE' core can't run:$skips"
+  local total; total="$(jq 'length' "$NODES_FILE")"
+  if [ "$srcs" -gt 1 ]; then
+    ok "imported $added node(s) from $got/$srcs subscription(s) — $total in list [core=$CORE]"
+  else
+    ok "imported $added node(s) — $total in list [core=$CORE]"
   fi
+  [ "$skipped" -gt 0 ] && warn "skipped $skipped node(s) the '$CORE' core can't run:$skips"
   reselect_active
   cmd_list
 }
@@ -1225,31 +1285,113 @@ cmd_add() {
   ensure_nodes
   local nodes; nodes="$(jq -c --arg n "$nm" 'map(select(.name != $n))' "$NODES_FILE")"
   nm="$(unique_name "$nm" "$nodes")"
-  jq -c --arg n "$nm" --argjson d "$d" '. + [{name:$n, descriptor:$d}]' <<<"$nodes" > "$NODES_FILE"
+  jq -c --arg n "$nm" --argjson d "$d" \
+    '. + [{name:$n, source:"manual", descriptor:$d}]' <<<"$nodes" > "$NODES_FILE"
   ok "added node: $nm ($typ)"
   echo "  activate it with:  xraycli use '$nm'"
 }
 
-cmd_import() {  # xraycli import <url|file>  (one-off, replaces node list)
-  local src="${1:?usage: xraycli import <url|file>}"
-  do_import "$src" replace
+# SUB_FILE holds one subscription URL per line, blank lines ignored. The old
+# single-URL layout is just a one-line file, so existing installs need no
+# migration.
+sub_urls()   { [ -f "$SUB_FILE" ] || return 0; grep -v '^[[:space:]]*$' "$SUB_FILE" 2>/dev/null || true; }
+sub_count()  { sub_urls | grep -c '' || true; }
+sub_has()    { local u; while IFS= read -r u; do [ "$u" = "$1" ] && return 0; done < <(sub_urls); return 1; }
+sub_forget() { { sub_urls | grep -vxF "$1" || true; } > "$SUB_FILE.tmp" && mv "$SUB_FILE.tmp" "$SUB_FILE"; }
+
+# Nodes an update must preserve: the hand-added ones. Nodes carrying a URL come
+# back from that URL, and pre-0.2 nodes have no source at all — both are rebuilt
+# or dropped, which is what `update` has always done.
+manual_nodes() { ensure_nodes; jq -c 'map(select((.source // "") == "manual"))' "$NODES_FILE"; }
+
+cmd_import() {  # xraycli import [--append] <url|file>   (one-off; URL not saved)
+  local append=0
+  if [ "${1:-}" = --append ]; then append=1; shift; fi
+  local src="${1:?usage: xraycli import [--append] <url|file>}"
+  need_jq; ensure_nodes
+  local base
+  if [ "$append" = 1 ]; then base="$(cat "$NODES_FILE")"; else base="$(manual_nodes)"; fi
+  import_write "$base" "$src" || die "import failed — node list unchanged"
+  [ "$append" = 1 ] || printf '%s    one-off import · keep it across updates with: xraycli sub add <url>%s\n' \
+    "$c_dim" "$c_rst"
+  return 0
+}
+
+sub_list() {
+  local n; n="$(sub_count)"
+  if [ "$n" -eq 0 ]; then
+    printf '  no subscriptions yet.\n'
+    printf '    add one : %sxraycli sub add '\''<url>'\''%s\n' "$c_dim" "$c_rst"
+    return 0
+  fi
+  need_jq; ensure_nodes
+  printf '%s  %-2s %-5s %s%s\n' "$c_dim" "#" "NODES" "URL" "$c_rst"
+  local i=1 u c
+  while IFS= read -r u; do
+    c="$(jq --arg s "$u" '[.[] | select((.source // "") == $s)] | length' "$NODES_FILE")"
+    printf '  %-2s %-5s %s\n' "$i" "$c" "$u"
+    i=$((i+1))
+  done < <(sub_urls)
+  printf '%s  refresh all: xraycli update%s\n' "$c_dim" "$c_rst"
+}
+
+sub_add() {
+  local url="${1:?usage: xraycli sub add <url>}"
+  need_jq; ensure_nodes
+  sub_has "$url" && die "already subscribed: $url"
+  # Save first so the node list can already resolve this URL to a SUB number,
+  # then take it back out if the URL turns out to yield nothing.
+  printf '%s\n' "$url" >> "$SUB_FILE"
+  import_write "$(cat "$NODES_FILE")" "$url" || { sub_forget "$url"; die "subscription not added"; }
+  ok "subscription saved — $(sub_count) in total"
+}
+
+sub_rm() {
+  local sel="${1:?usage: xraycli sub rm <#|url>}" url
+  [ "$(sub_count)" -gt 0 ] || die "no subscriptions"
+  if [[ "$sel" =~ ^[0-9]+$ ]]; then
+    url="$(sub_urls | sed -n "${sel}p")"
+    [ -n "$url" ] || die "no subscription #$sel — see: xraycli sub list"
+  else
+    url="$sel"; sub_has "$url" || die "not subscribed: $url"
+  fi
+  need_jq; ensure_nodes
+  sub_forget "$url"
+  local before after
+  before="$(jq 'length' "$NODES_FILE")"
+  jq --arg s "$url" 'map(select((.source // "") != $s))' "$NODES_FILE" > "$NODES_FILE.tmp" \
+    && mv "$NODES_FILE.tmp" "$NODES_FILE"
+  after="$(jq 'length' "$NODES_FILE")"
+  ok "removed subscription: $url  ($((before-after)) node(s) dropped)"
+  reselect_active
+  cmd_list
 }
 
 cmd_sub() {
-  case "${1:-show}" in
-    set)   printf '%s\n' "${2:?usage: xraycli sub set <url>}" > "$SUB_FILE"; ok "subscription URL saved" ;;
-    show)  [ -f "$SUB_FILE" ] && cat "$SUB_FILE" || echo "(no subscription set)" ;;
-    clear) rm -f "$SUB_FILE"; ok "subscription cleared" ;;
-    update) cmd_update ;;
-    *) die "usage: xraycli sub {set <url>|show|clear|update}" ;;
+  case "${1:-list}" in
+    add)        sub_add "${2:-}" ;;
+    rm|remove)  sub_rm "${2:-}" ;;
+    list|show)  sub_list ;;
+    set)        # "this is my only subscription" — replace the lot
+      local url="${2:?usage: xraycli sub set <url>}"
+      import_write "$(manual_nodes)" "$url" || die "subscription not set — node list unchanged"
+      printf '%s\n' "$url" > "$SUB_FILE"
+      ok "subscription set (replaced any others)" ;;
+    clear)      rm -f "$SUB_FILE"; ok "all subscriptions forgotten (nodes kept — drop them with: xraycli rm <name>)" ;;
+    update)     cmd_update ;;
+    *) die "usage: xraycli sub {add <url>|rm <#|url>|list|set <url>|clear|update}" ;;
   esac
 }
 
 cmd_update() {
-  [ -f "$SUB_FILE" ] || die "no subscription set — run: xraycli sub set '<url>'"
-  local url; url="$(cat "$SUB_FILE")"
-  info "updating from subscription: $url"
-  do_import "$url" replace
+  need_jq; ensure_nodes
+  local n; n="$(sub_count)"
+  [ "$n" -gt 0 ] || die "no subscription set — run: xraycli sub add '<url>'"
+  info "updating from $n subscription(s)"
+  local urls=() u
+  while IFS= read -r u; do urls+=("$u"); done < <(sub_urls)
+  # Rebuild every subscription's nodes; hand-added ones ride through untouched.
+  import_write "$(manual_nodes)" "${urls[@]}" || die "update failed — node list unchanged"
 }
 
 # --------------------------------------------------------------------------- #
@@ -1388,11 +1530,14 @@ ${c_bld}Lifecycle${c_rst}
 
 ${c_bld}Nodes / subscription${c_rst}  ${c_dim}(auto-detects base64 & Clash; skips protocols Xray can't run)${c_rst}
   add '<share-link>'    add one node (vless:// vmess:// trojan:// ss://)
-  sub set '<url>'       save a subscription URL
-  sub show|clear        show / clear the subscription URL
-  update                fetch the saved subscription and rebuild the node list
-  import <url|file>     one-off import from a URL or local file
-  list                  list saved nodes ('*' = active)
+  sub add '<url>'       subscribe to a URL and import its nodes (repeatable)
+  sub list              list subscriptions with their node counts
+  sub rm <#|url>        unsubscribe and drop the nodes that came from it
+  sub set '<url>'       make this the only subscription (replaces any others)
+  sub clear             forget every subscription URL (keeps the nodes)
+  update                re-fetch every subscription and rebuild the node list
+  import [--append] <url|file>   one-off import from a URL or local file
+  list                  list saved nodes ('●' = active)
   use <index|name>      select the active node
   remove <index|name>   delete a node
   current               print the active node

@@ -502,8 +502,8 @@ summary() {
   echo "Next steps:"
   echo "  1) Reload your shell so PATH applies:            source ~/.bashrc"
   echo "  2) Add a node from a share link or subscription (base64 or Clash):"
-  echo "         xraycli add   '<share-link>'"
-  echo "         xraycli sub set '<subscription-url>' && xraycli update"
+  echo "         xraycli add     '<share-link>'"
+  echo "         xraycli sub add '<subscription-url>'    # repeatable; 'xraycli update' refreshes all"
   echo "  3) Start it and check status:"
   echo "         xraycli enable      # start now + auto-start on boot"
   echo "         xraycli status"
@@ -551,12 +551,13 @@ run_wizard() {
   # 1) subscription / first node
   echo
   if ask "1) Import a subscription now?" y; then
-    read -rp "   Paste the subscription URL (blank = skip): " url || true
-    if [ -n "${url:-}" ]; then
-      # 'update' already prints the resulting node list — don't list again.
-      "$xr" sub set "$url" && "$xr" update \
-        || warn "import failed — retry later with:  xraycli sub set '<url>' && xraycli update"
-    fi
+    while :; do
+      read -rp "   Paste the subscription URL (blank = done): " url || true
+      [ -n "${url:-}" ] || break
+      # 'sub add' fetches, imports and prints the node list itself.
+      "$xr" sub add "$url" || warn "import failed — retry later with:  xraycli sub add '<url>'"
+      ask "   Add another subscription?" n || break
+    done
   fi
 
   # 2) start now + auto-start on boot
