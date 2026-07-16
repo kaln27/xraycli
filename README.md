@@ -54,6 +54,19 @@ Xray-core for your CPU, fetches the `xraycli` control script, picks free ports,
 and sets up the user service. No `git clone` needed. Pass installer options
 straight through, e.g. `… /install.sh) --no-service`.
 
+**Behind the GreatFirewall / flaky GitHub?** The installer probes GitHub first
+and, only if it looks unreachable, routes every download through the
+[gh-proxy.org](https://gh-proxy.org) mirror automatically — so you don't have to
+do anything. If GitHub is blocked so hard that even `install.sh` won't load,
+fetch the script itself through the mirror too:
+
+```bash
+bash <(curl -Ls https://gh-proxy.org/https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh)
+```
+
+Force the choice with `--gh-proxy` (always mirror) or `--no-gh-proxy` (always
+direct). Using a mirror means trusting its operator with your download stream.
+
 > Prefer `bash <(curl …)` over `curl … | bash` — it keeps your terminal on
 > stdin, so confirmation prompts still work.
 
@@ -92,7 +105,9 @@ source ~/.bashrc
 | `--no-bashrc` | Do not modify `~/.bashrc` |
 | `--no-deps` | Do not auto-install missing dependencies |
 | `--no-wizard` | Skip the interactive setup wizard at the end |
-| `--mirror PREFIX` | Prefix prepended to the GitHub download URL (for CN mirrors) |
+| `--gh-proxy` | Force GitHub downloads through the mirror (gh-proxy.org) |
+| `--no-gh-proxy` | Force direct GitHub downloads (never use the mirror) |
+| `--mirror PREFIX` | Use a custom mirror prefix instead of gh-proxy.org |
 
 ---
 

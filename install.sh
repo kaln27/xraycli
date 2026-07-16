@@ -28,7 +28,9 @@
 #   --no-service         Do not install/enable the systemd user service
 #   --no-bashrc          Do not modify ~/.bashrc
 #   --no-wizard          Skip the interactive setup wizard at the end
-#   --mirror <prefix>    Prefix prepended to the GitHub download URL (for CN mirrors)
+#   --gh-proxy           Force GitHub downloads through the mirror (gh-proxy.org)
+#   --no-gh-proxy        Force direct GitHub downloads (never use the mirror)
+#   --mirror <prefix>    Use a custom mirror prefix instead of gh-proxy.org
 #   -h, --help           Show this help
 #
 set -euo pipefail
@@ -79,6 +81,14 @@ DO_SERVICE=1
 DO_BASHRC=1
 DO_DEPS=1
 DO_WIZARD=1                 # 1 → run the interactive setup wizard at the end
+
+# GitHub download routing. MIRROR is the effective prefix prepended to every
+# github.com/raw.githubusercontent.com URL ("" = fetch directly). When flaky
+# networks block GitHub, resolve_mirror() fills it with GH_PROXY_DEFAULT.
+#   GH_PROXY_MODE: auto = probe GitHub, mirror only if unreachable
+#                  on   = always mirror   ·   off = always direct
+readonly GH_PROXY_DEFAULT="https://gh-proxy.org/"
+GH_PROXY_MODE="auto"
 MIRROR=""
 
 # Username-derived port window. Same $USER always maps to the same SOCKS base,
@@ -125,8 +135,15 @@ Options:
   --no-bashrc          Do not modify ~/.bashrc
   --no-deps            Do not attempt to install missing dependencies
   --no-wizard          Skip the interactive setup wizard at the end
-  --mirror <prefix>    Prefix prepended to the GitHub download URL (CN mirrors)
+  --gh-proxy           Force GitHub downloads through the mirror (gh-proxy.org)
+  --no-gh-proxy        Force direct GitHub downloads (never use the mirror)
+  --mirror <prefix>    Use a custom mirror prefix instead of gh-proxy.org
   -h, --help           Show this help
+
+By default GitHub reachability is probed first; the mirror engages only when
+GitHub looks unreachable. Behind a firewall you can also fetch install.sh itself
+through the mirror:
+  bash <(curl -Ls https://gh-proxy.org/https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh)
 EOF
   exit "${1:-0}"
 }
@@ -147,6 +164,8 @@ while [ $# -gt 0 ]; do
     --no-bashrc)  DO_BASHRC=0; shift ;;
     --no-deps)    DO_DEPS=0; shift ;;
     --no-wizard)  DO_WIZARD=0; shift ;;
+    --gh-proxy)   GH_PROXY_MODE=on; shift ;;
+    --no-gh-proxy) GH_PROXY_MODE=off; shift ;;
     -h|--help)    usage 0 ;;
     *) die "unknown option: $1 (try --help)" ;;
   esac
@@ -186,10 +205,47 @@ fetch_stdout() {  # fetch_stdout <url> -> stdout
   else return 1; fi
 }
 
+# Can we reach GitHub directly? A cheap 1-byte GET of a raw file with a short
+# cap. raw.githubusercontent.com is the right probe: releases sit behind a CDN
+# that can resolve even when raw/api are blocked, and it's raw + api that the
+# install actually stalls on.
+github_reachable() {
+  local u="https://raw.githubusercontent.com/$REPO_SLUG/$REPO_BRANCH/install.sh"
+  if   have curl; then curl -fsS --max-time 6 -r 0-0 -o /dev/null "$u" 2>/dev/null
+  elif have wget; then wget -q --timeout=6 --tries=1 -O /dev/null "$u" 2>/dev/null
+  else return 0; fi   # no fetcher yet → don't force a mirror; download() will die later
+}
+
+# Decide the effective $MIRROR prefix for all GitHub downloads. Runs once, after
+# ensure_deps (so curl/wget exist), before install_core.
+resolve_mirror() {
+  if [ -n "$MIRROR" ]; then info "using custom mirror: $MIRROR"; return; fi
+  case "$GH_PROXY_MODE" in
+    off) return ;;                                                    # forced direct
+    on)  MIRROR="$GH_PROXY_DEFAULT"; info "GitHub proxy forced on: $MIRROR" ;;
+    auto)
+      info "Probing GitHub reachability"
+      if github_reachable; then
+        ok "GitHub reachable — downloading directly"
+      else
+        MIRROR="$GH_PROXY_DEFAULT"
+        warn "GitHub looks unreachable — routing downloads via $MIRROR"
+        warn "(force direct: --no-gh-proxy   ·   custom mirror: --mirror <prefix>)"
+      fi ;;
+  esac
+}
+
 latest_tag() {  # <owner/repo> -> latest release tag (e.g. v1.13.14)
   local repo="$1" tag
+  # Direct API is primary: it names the true *latest release*.
   tag="$(fetch_stdout "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
          | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')"
+  # Fallback when the API is unreachable (e.g. the mirror 403s api.github.com):
+  # ls-remote the tag list — it inherits $MIRROR, so it works behind the proxy.
+  if [ -z "$tag" ] && have git; then
+    tag="$(git ls-remote --tags --refs "${MIRROR}https://github.com/$repo.git" 2>/dev/null \
+           | awk -F/ '{print $NF}' | grep -E '^v?[0-9]+(\.[0-9]+)+$' | sort -V | tail -1)"
+  fi
   [ -n "$tag" ] && printf '%s\n' "$tag"
 }
 
@@ -354,7 +410,8 @@ install_core_singbox() {
   local arch ver tag num url tmp
   arch="$(detect_singbox_arch)"
   if [ "$CORE_VERSION" = latest ]; then
-    tag="$(latest_tag "$SINGBOX_REPO")" || die "could not resolve latest sing-box version"
+    tag="$(latest_tag "$SINGBOX_REPO")" \
+      || die "could not resolve latest sing-box version — install git, or pin one with --version <vX.Y.Z>"
   else
     tag="$CORE_VERSION"
   fi
@@ -436,9 +493,10 @@ install_script() {
   if [ -n "${SCRIPT_DIR:-}" ] && [ -f "$src" ]; then
     install -m 0755 "$src" "$BIN_DIR/xraycli"       # local checkout
   else
-    info "no local checkout — fetching from $XRAYCLI_RAW_BASE/bin/xraycli"
-    download "$XRAYCLI_RAW_BASE/bin/xraycli" "$BIN_DIR/xraycli" \
-      || die "could not download the control script from $XRAYCLI_RAW_BASE/bin/xraycli"
+    local rawurl="${MIRROR}$XRAYCLI_RAW_BASE/bin/xraycli"
+    info "no local checkout — fetching from $rawurl"
+    download "$rawurl" "$BIN_DIR/xraycli" \
+      || die "could not download the control script from $rawurl"
     head -1 "$BIN_DIR/xraycli" | grep -q '^#!' \
       || die "downloaded control script looks invalid (got HTML? check the URL/branch)"
     chmod 0755 "$BIN_DIR/xraycli"
@@ -587,6 +645,7 @@ main() {
   printf '%s%s installer%s\n\n' "$c_bld" "$APP" "$c_rst"
   choose_core
   preflight
+  resolve_mirror
   install_core
   choose_ports
   write_env

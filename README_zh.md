@@ -45,6 +45,17 @@ bash <(curl -Ls https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh
 按 CPU 架构下载对应的 Xray-core，拉取 `xraycli` 控制脚本，挑选空闲端口，并配置好用户级服务。
 **不需要 `git clone`**。安装参数可直接追加，例如 `… /install.sh) --no-service`。
 
+**访问 GitHub 不稳定？** 安装脚本会先探测 GitHub 是否可达，只有在不可达时才自动把所有下载
+经 [gh-proxy.org](https://gh-proxy.org) 镜像走一遍——你什么都不用做。如果 GitHub 被墙到
+连 `install.sh` 本身都拉不下来，把脚本本体也经镜像获取即可：
+
+```bash
+bash <(curl -Ls https://gh-proxy.org/https://raw.githubusercontent.com/kaln27/xraycli/main/install.sh)
+```
+
+想强制指定：`--gh-proxy`（始终走镜像）或 `--no-gh-proxy`（始终直连）。注意：用镜像意味着把
+你的下载流量交给它的运营方，需自行信任。
+
 > 建议用 `bash <(curl …)` 而不是 `curl … | bash`：前者会保留终端 stdin，交互确认才能正常工作。
 
 在交互式运行时，安装脚本会**先问用哪个内核**（Xray 或 sing-box，默认 Xray），最后再进入一个
@@ -80,7 +91,9 @@ source ~/.bashrc
 | `--no-bashrc` | 不修改 `~/.bashrc` |
 | `--no-deps` | 不自动安装缺失依赖 |
 | `--no-wizard` | 跳过安装结束时的交互式设置向导 |
-| `--mirror PREFIX` | 给 GitHub 下载地址加前缀（国内镜像加速用） |
+| `--gh-proxy` | 强制所有 GitHub 下载走镜像（gh-proxy.org） |
+| `--no-gh-proxy` | 强制直连 GitHub（从不走镜像） |
+| `--mirror PREFIX` | 用自定义镜像前缀替代 gh-proxy.org |
 
 ---
 
